@@ -464,7 +464,6 @@ pub fn source(alloc: &mut ThreadAllocator) -> Token {
     let ext_id = ExtTokenId::new(id, false);
     debug_assert!(block.header.load(Relaxed) == TokenBlockHeader::INVALID_SOURCE);
     debug_assert!(block.primary_child.load(Relaxed).is_none());
-    debug_assert!(block.secondary_child_id.load(Relaxed) == TokenId::ALWAYS);
     debug_assert!(block.secondary_child_block.load(Relaxed).is_none());
     let n_header = TokenBlockHeader::unlocked(ext_id);
     block.header.store(n_header, Relaxed);
@@ -825,7 +824,6 @@ fn dependent_exact(
         .header
         .store(TokenBlockHeader::unlocked(res_ext_id), Relaxed);
     debug_assert!(res_block.base.primary_child.load(Relaxed).is_none());
-    debug_assert!(res_block.base.secondary_child_id.load(Relaxed) == TokenId::ALWAYS);
     debug_assert!(res_block.base.secondary_child_block.load(Relaxed).is_none());
     res_block.dep_range.store(dep_range, Relaxed);
     res_block.left_parent.store(left_block, Relaxed);
@@ -1059,9 +1057,11 @@ pub fn invalidate_source(
 /// dependency list and secondary dependency tree.
 fn invalidate_children(alloc: &mut ThreadAllocator, block: &'static TokenBlock) {
     if let Some(primary_child) = block.primary_child.load(Relaxed) {
+        block.primary_child.store(None, Relaxed);
         invalidate_primary(alloc, primary_child);
     }
     if let Some(secondary_child_block) = block.secondary_child_block.load(Relaxed) {
+        block.secondary_child_block.store(None, Relaxed);
         invalidate_secondary(alloc, secondary_child_block, &block.secondary_child_id);
     }
 }
@@ -1098,6 +1098,7 @@ fn invalidate_primary(alloc: &mut ThreadAllocator, mut block: &'static Dependent
 
         // Free the block
         let next = block.next_primary_sibling.load(Relaxed);
+        block.next_primary_sibling.store(None, Relaxed);
         alloc.free_dependent_token_block(block);
 
         // Continue traversing the primary dependency list
@@ -1180,11 +1181,16 @@ fn invalidate_secondary(
             }
         }
         Err(block) => {
+            // Invalidate children
             for i in 0..(1 << DependentTreeBlock::SEARCH_BITS) {
                 if let Some(child) = block.blocks[i].load(Relaxed) {
+                    block.blocks[i].store(None, Relaxed);
                     invalidate_secondary(alloc, child, &block.ids[i]);
                 }
             }
+
+            // Free the block
+            alloc.free_dependent_tree_block(block);
         }
     }
 }
@@ -1193,12 +1199,18 @@ fn invalidate_secondary(
 pub struct ThreadAllocator {
     next_token_id: u64,
     last_reserved_token_id: u64,
+    free_source_token_blocks: Vec<&'static TokenBlock>,
+    free_dependent_token_blocks: Vec<&'static DependentTokenBlock>,
+    free_dependent_tree_blocks: Vec<&'static DependentTreeBlock>,
 }
 
 thread_local! {
     static ALLOC: RefCell<ThreadAllocator> = RefCell::new(ThreadAllocator {
         next_token_id: 0,
-        last_reserved_token_id: 0
+        last_reserved_token_id: 0,
+        free_source_token_blocks: Vec::new(),
+        free_dependent_token_blocks: Vec::new(),
+        free_dependent_tree_blocks: Vec::new(),
     });
 }
 
@@ -1224,35 +1236,32 @@ impl ThreadAllocator {
 
     /// Gets an unused non-dependent [`TokenBlock`].
     fn alloc_source_token_block(&mut self) -> &'static TokenBlock {
-        // TODO: Real implementation
-        Box::leak(Box::default())
+        alloc_block(128, &mut self.free_source_token_blocks)
     }
 
     /// Reclaims an unused non-dependent [`TokenBlock`].
     fn free_source_token_block(&mut self, block: &'static TokenBlock) {
-        // TODO: Real implementation
+        self.free_source_token_blocks.push(block);
     }
 
     /// Gets an unused [`DependentTokenBlock`].
     fn alloc_dependent_token_block(&mut self) -> &'static DependentTokenBlock {
-        // TODO: Real implementation
-        Box::leak(Box::default())
+        alloc_block(64, &mut self.free_dependent_token_blocks)
     }
 
     /// Reclaims an unused  [`DependentTokenBlock`].
     fn free_dependent_token_block(&mut self, block: &'static DependentTokenBlock) {
-        // TODO: Real implementation
+        self.free_dependent_token_blocks.push(block);
     }
 
     /// Gets an unused [`DependentTreeBlock`].
     fn alloc_dependent_tree_block(&mut self) -> &'static DependentTreeBlock {
-        // TODO: Real implementation
-        Box::leak(Box::default())
+        alloc_block(64, &mut self.free_dependent_tree_blocks)
     }
 
     /// Reclaims an unused [`DependentTreeBlock`].
     fn free_dependent_tree_block(&mut self, block: &'static DependentTreeBlock) {
-        // TODO: Real implementation
+        self.free_dependent_tree_blocks.push(block);
     }
 }
 
@@ -1261,3 +1270,28 @@ const NUM_RESERVED_TOKEN_IDS: u64 = 32;
 
 /// The global next unused [`TokenId`].
 static NEXT_TOKEN_ID: AtomicU64 = AtomicU64::new(2);
+
+/// Allocates a block of a given type.
+fn alloc_block<T: Default>(chunk_size: usize, free_blocks: &mut Vec<&'static T>) -> &'static T {
+    if let Some(res) = free_blocks.pop() {
+        res
+    } else {
+        let chunk = std::iter::repeat_with(|| T::default())
+            .take(chunk_size)
+            .collect::<Vec<_>>()
+            .leak();
+        
+        // Tell miri that the leak is intentional
+        #[cfg(miri)]
+        {
+            extern "Rust" {
+                fn miri_static_root(ptr: *const u8);
+            }
+            unsafe {
+                miri_static_root(chunk.as_ptr().cast::<_>());
+            }
+        }
+        free_blocks.extend(chunk.iter());
+        free_blocks.pop().unwrap()
+    }
+}
