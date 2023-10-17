@@ -90,9 +90,9 @@ impl DependentRange {
         Self::new(TokenId(split), scale)
     }
 
-    /// Gets the splitting [`TokenId`] for this range. The primary parent of a dependent token
+    /// Gets the splitting [`TokenId`] for this range. The "left" parent of a dependent token
     /// with this range is only sensitive to `TokenId`s less than the splitting `TokenId` and the
-    /// secondary parent is only sensitive to `TokenId`s greater than or equal to the splitting
+    /// "right" parent is only sensitive to `TokenId`s greater than or equal to the splitting
     /// `TokenId`.
     pub fn split(&self) -> TokenId {
         TokenId(self.0 & ((1 << TokenId::NUM_BITS) - 1))
@@ -217,9 +217,22 @@ pub struct TokenBlock {
 #[repr(C)]
 struct DependentTokenBlock {
     base: TokenBlock,
+
+    /// Describes the range of source [`TokenId`]s this token is sensitive to.
     dep_range: Atomic<DependentRange>,
-    primary_parent: Atomic<TokenBlockRef<'static>>,
-    secondary_parent: Atomic<TokenBlockRef<'static>>,
+
+    /// A reference to the [`TokenBlock`] which describes the "left" parent of this token. The
+    /// left parent is only sensitive to source [`TokenId`]s which are less than the splitting
+    /// `TokenId` of `dep_range`.
+    left_parent: Atomic<TokenBlockRef<'static>>,
+
+    /// A reference to the [`TokenBlock`] which describes the "right" parent of this token. The
+    /// right parent is sensitive to source [`TokenId`]s which are greater than or equal to the
+    /// splitting `TokenId` of `dep_range`.
+    right_parent: Atomic<TokenBlockRef<'static>>,
+
+    /// The next [`DependentTokenBlock`] in the dependency list of the primary parent for this
+    /// token, or [`None`] if this is the last block in the list.
     next_primary_sibling: Atomic<Option<&'static DependentTokenBlock>>,
 }
 
@@ -246,8 +259,8 @@ impl Default for DependentTokenBlock {
         Self {
             base: Default::default(),
             dep_range: Atomic::new(DependentRange(0)),
-            primary_parent: Atomic::new(TokenBlockRef::from_ref(&ALWAYS_NEVER)),
-            secondary_parent: Atomic::new(TokenBlockRef::from_ref(&ALWAYS_NEVER)),
+            left_parent: Atomic::new(TokenBlockRef::from_ref(&ALWAYS_NEVER)),
+            right_parent: Atomic::new(TokenBlockRef::from_ref(&ALWAYS_NEVER)),
             next_primary_sibling: Atomic::new(None),
         }
     }
@@ -392,14 +405,14 @@ impl DependentTokenBlock {
     /// Attempts to get the [`DependentInfo`] for a token using the block. Returns [`None`] if
     /// the token is invalid.
     fn dependent_info(&self, id: TokenId) -> Option<DependentInfo> {
-        let primary_parent = self.primary_parent.load(Relaxed);
-        let secondary_parent = self.secondary_parent.load(Relaxed);
+        let left_parent = self.left_parent.load(Relaxed);
+        let right_parent = self.right_parent.load(Relaxed);
         let dep_range = self.dep_range.load(Relaxed);
         fence(Acquire);
         if self.base.header.load(Relaxed).id() == id {
             Some(DependentInfo {
-                primary_parent,
-                secondary_parent,
+                left_parent,
+                right_parent,
                 dep_range,
             })
         } else {
@@ -410,8 +423,8 @@ impl DependentTokenBlock {
 
 /// Provides dependent-specific information about a dependent [`Token`].
 struct DependentInfo {
-    primary_parent: TokenBlockRef<'static>,
-    secondary_parent: TokenBlockRef<'static>,
+    left_parent: TokenBlockRef<'static>,
+    right_parent: TokenBlockRef<'static>,
     dep_range: DependentRange,
 }
 
@@ -540,134 +553,104 @@ fn dependent_dep(
         let Some(b_info) = b_block.dependent_info(b_id) else {
             return never();
         };
+        let left_block;
+        let left_info;
+        let left_id;
+        let right_block;
+        let right_info;
+        let right_id;
         match a_info.dep_range.split().cmp(&b_info.dep_range.split()) {
             Less => {
-                if a_info.dep_range.max_bound() < b_info.dep_range.min_bound() {
-                    dependent_exact(
-                        alloc,
-                        a_block.into(),
-                        ExtTokenId::new(a_id, true),
-                        b.block,
-                        b.ext_id,
-                        DependentRange::between(
-                            a_info.dep_range.min_bound(),
-                            b_info.dep_range.max_bound(),
-                        ),
-                    )
-                } else if a_info.dep_range.max_bound() < b_info.dep_range.split() {
-                    debug_assert!(b_info.dep_range.min_bound() <= a_info.dep_range.min_bound());
-                    let Some(b_primary_parent) = b_info.primary_parent.token() else {
-                        return never();
-                    };
-                    let Some(b_secondary_parent) = b_info.secondary_parent.token() else {
-                        return never();
-                    };
-                    let primary = dependent_dep(alloc, a_block, a_info, a_id, b_primary_parent);
-                    dependent_exact(
-                        alloc,
-                        primary.block,
-                        primary.ext_id,
-                        b_secondary_parent.block,
-                        b_secondary_parent.ext_id,
-                        b_info.dep_range,
-                    )
-                } else {
-                    debug_assert!(a_info.dep_range.split() <= b_info.dep_range.min_bound());
-                    debug_assert!(b_info.dep_range.max_bound() <= a_info.dep_range.max_bound());
-                    let Some(a_primary_parent) = a_info.primary_parent.token() else {
-                        return never();
-                    };
-                    let Some(a_secondary_parent) = a_info.secondary_parent.token() else {
-                        return never();
-                    };
-                    let secondary = dependent_dep(alloc, b_block, b_info, b_id, a_secondary_parent);
-                    dependent_exact(
-                        alloc,
-                        a_primary_parent.block,
-                        a_primary_parent.ext_id,
-                        secondary.block,
-                        secondary.ext_id,
-                        a_info.dep_range,
-                    )
-                }
+                left_block = a_block;
+                left_info = a_info;
+                left_id = a_id;
+                right_block = b_block;
+                right_info = b_info;
+                right_id = b_id;
             }
             Equal => {
-                let Some(a_primary_parent) = a_info.primary_parent.token() else {
+                let Some(a_left_parent) = a_info.left_parent.token() else {
                     return never();
                 };
-                let Some(a_secondary_parent) = a_info.secondary_parent.token() else {
+                let Some(a_right_parent) = a_info.right_parent.token() else {
                     return never();
                 };
-                let Some(b_primary_parent) = b_info.primary_parent.token() else {
+                let Some(b_left_parent) = b_info.left_parent.token() else {
                     return never();
                 };
-                let Some(b_secondary_parent) = b_info.secondary_parent.token() else {
+                let Some(b_right_parent) = b_info.right_parent.token() else {
                     return never();
                 };
-                let primary = dependent_non_always(alloc, a_primary_parent, b_primary_parent);
-                let secondary = dependent_non_always(alloc, a_secondary_parent, b_secondary_parent);
-                dependent_exact(
+                let left = dependent_non_always(alloc, a_left_parent, b_left_parent);
+                let right = dependent_non_always(alloc, a_right_parent, b_right_parent);
+                return dependent_exact(
                     alloc,
-                    primary.block,
-                    primary.ext_id,
-                    secondary.block,
-                    secondary.ext_id,
+                    left.block,
+                    left.ext_id,
+                    right.block,
+                    right.ext_id,
                     DependentRange::new(
                         a_info.dep_range.split(),
                         u8::max(a_info.dep_range.scale(), b_info.dep_range.scale()),
                     ),
-                )
+                );
             }
             Greater => {
-                if b_info.dep_range.max_bound() < a_info.dep_range.min_bound() {
-                    dependent_exact(
-                        alloc,
-                        b_block.into(),
-                        ExtTokenId::new(b_id, true),
-                        a_block.into(),
-                        ExtTokenId::new(a_id, true),
-                        DependentRange::between(
-                            b_info.dep_range.min_bound(),
-                            a_info.dep_range.max_bound(),
-                        ),
-                    )
-                } else if b_info.dep_range.split() <= a_info.dep_range.min_bound() {
-                    debug_assert!(a_info.dep_range.max_bound() <= b_info.dep_range.max_bound());
-                    let Some(b_primary_parent) = b_info.primary_parent.token() else {
-                        return never();
-                    };
-                    let Some(b_secondary_parent) = b_info.secondary_parent.token() else {
-                        return never();
-                    };
-                    let secondary = dependent_dep(alloc, a_block, a_info, a_id, b_secondary_parent);
-                    dependent_exact(
-                        alloc,
-                        b_primary_parent.block,
-                        b_primary_parent.ext_id,
-                        secondary.block,
-                        secondary.ext_id,
-                        b_info.dep_range,
-                    )
-                } else {
-                    debug_assert!(a_info.dep_range.min_bound() <= b_info.dep_range.min_bound());
-                    debug_assert!(b_info.dep_range.max_bound() < a_info.dep_range.split());
-                    let Some(a_primary_parent) = a_info.primary_parent.token() else {
-                        return never();
-                    };
-                    let Some(a_secondary_parent) = a_info.secondary_parent.token() else {
-                        return never();
-                    };
-                    let primary = dependent_dep(alloc, b_block, b_info, b_id, a_primary_parent);
-                    dependent_exact(
-                        alloc,
-                        primary.block,
-                        primary.ext_id,
-                        a_secondary_parent.block,
-                        a_secondary_parent.ext_id,
-                        a_info.dep_range,
-                    )
-                }
+                left_block = b_block;
+                left_info = b_info;
+                left_id = b_id;
+                right_block = a_block;
+                right_info = a_info;
+                right_id = a_id;
             }
+        }
+        if left_info.dep_range.max_bound() < right_info.dep_range.min_bound() {
+            dependent_exact(
+                alloc,
+                left_block.into(),
+                ExtTokenId::new(left_id, true),
+                right_block.into(),
+                ExtTokenId::new(right_id, true),
+                DependentRange::between(
+                    left_info.dep_range.min_bound(),
+                    right_info.dep_range.max_bound(),
+                ),
+            )
+        } else if left_info.dep_range.max_bound() < right_info.dep_range.split() {
+            debug_assert!(right_info.dep_range.min_bound() <= left_info.dep_range.min_bound());
+            let Some(right_left) = right_info.left_parent.token() else {
+                return never();
+            };
+            let Some(right_right) = right_info.right_parent.token() else {
+                return never();
+            };
+            let left = dependent_dep(alloc, left_block, left_info, left_id, right_left);
+            dependent_exact(
+                alloc,
+                left.block,
+                left.ext_id,
+                right_right.block,
+                right_right.ext_id,
+                right_info.dep_range,
+            )
+        } else {
+            debug_assert!(left_info.dep_range.split() <= right_info.dep_range.min_bound());
+            debug_assert!(right_info.dep_range.max_bound() <= left_info.dep_range.max_bound());
+            let Some(left_left) = left_info.left_parent.token() else {
+                return never();
+            };
+            let Some(left_right) = left_info.right_parent.token() else {
+                return never();
+            };
+            let right = dependent_dep(alloc, right_block, right_info, right_id, left_right);
+            dependent_exact(
+                alloc,
+                left_left.block,
+                left_left.ext_id,
+                right.block,
+                right.ext_id,
+                left_info.dep_range,
+            )
         }
     } else {
         dependent_dep_source(
@@ -693,19 +676,19 @@ fn dependent_dep_source(
     #[allow(clippy::collapsible_else_if)]
     if a_info.dep_range.split() <= b_id {
         if b_id <= a_info.dep_range.max_bound() {
-            let Some(a_primary_parent) = a_info.primary_parent.token() else {
+            let Some(a_left) = a_info.left_parent.token() else {
                 return never();
             };
-            let Some(a_secondary_parent) = a_info.secondary_parent.token() else {
+            let Some(a_right) = a_info.right_parent.token() else {
                 return never();
             };
-            let secondary = dependent_source(alloc, b_block, b_id, a_secondary_parent);
+            let right = dependent_source(alloc, b_block, b_id, a_right);
             dependent_exact(
                 alloc,
-                a_primary_parent.block,
-                a_primary_parent.ext_id,
-                secondary.block,
-                secondary.ext_id,
+                a_left.block,
+                a_left.ext_id,
+                right.block,
+                right.ext_id,
                 a_info.dep_range,
             )
         } else {
@@ -720,19 +703,19 @@ fn dependent_dep_source(
         }
     } else {
         if b_id >= a_info.dep_range.min_bound() {
-            let Some(a_primary_parent) = a_info.primary_parent.token() else {
+            let Some(a_left) = a_info.left_parent.token() else {
                 return never();
             };
-            let Some(a_secondary_parent) = a_info.secondary_parent.token() else {
+            let Some(a_right) = a_info.right_parent.token() else {
                 return never();
             };
-            let primary = dependent_source(alloc, b_block, b_id, a_primary_parent);
+            let left = dependent_source(alloc, b_block, b_id, a_left);
             dependent_exact(
                 alloc,
-                primary.block,
-                primary.ext_id,
-                a_secondary_parent.block,
-                a_secondary_parent.ext_id,
+                left.block,
+                left.ext_id,
+                a_right.block,
+                a_right.ext_id,
                 a_info.dep_range,
             )
         } else {
@@ -748,19 +731,21 @@ fn dependent_dep_source(
     }
 }
 
-/// Gets or creates a [`Token`] which is dependent on *exactly* two tokens in the given order.
+/// Gets or creates a [`Token`] which is dependent on *exactly* the two given tokens. The tokens
+/// must be provided in order such that the [`DependentRange`] of the `left` token is less than,
+/// and not overlapping with, the [`DependentRange`] of the `right` token.
 fn dependent_exact(
     alloc: &mut ThreadAllocator,
-    primary_block: TokenBlockRef<'static>,
-    primary_ext_id: ExtTokenId,
-    secondary_block: TokenBlockRef<'static>,
-    secondary_ext_id: ExtTokenId,
+    left_block: TokenBlockRef<'static>,
+    left_ext_id: ExtTokenId,
+    right_block: TokenBlockRef<'static>,
+    right_ext_id: ExtTokenId,
     dep_range: DependentRange,
 ) -> Token {
-    let primary_block_ref = primary_block;
-    let secondary_block_ref = secondary_block;
-    let primary_block = primary_block.as_ref();
-    let secondary_block = secondary_block.as_ref();
+    let primary_block = left_block.as_ref();
+    let primary_ext_id = left_ext_id;
+    let secondary_block = right_block.as_ref();
+    let secondary_ext_id = right_ext_id;
 
     // Check whether such a token already exists by searching the secondary dependency tree
     if let Ok(res) = search_secondary(primary_ext_id.into(), secondary_block) {
@@ -843,10 +828,8 @@ fn dependent_exact(
     debug_assert!(res_block.base.secondary_child_id.load(Relaxed) == TokenId::ALWAYS);
     debug_assert!(res_block.base.secondary_child_block.load(Relaxed).is_none());
     res_block.dep_range.store(dep_range, Relaxed);
-    res_block.primary_parent.store(primary_block_ref, Relaxed);
-    res_block
-        .secondary_parent
-        .store(secondary_block_ref, Relaxed);
+    res_block.left_parent.store(left_block, Relaxed);
+    res_block.right_parent.store(right_block, Relaxed);
 
     // Add token to the primary dependency list
     let old_primary_child = primary_block.primary_child.swap(Some(res_block), Relaxed);
@@ -910,7 +893,7 @@ fn search_secondary(
             match cur_block.as_token_or_block() {
                 Ok(cur_block) => {
                     let cur_id = slot_id.load(Relaxed);
-                    let primary_parent = cur_block.primary_parent.load(Relaxed);
+                    let primary_parent = cur_block.left_parent.load(Relaxed);
                     let primary_parent_header = primary_parent.as_ref().header.load(Relaxed);
                     fence(Acquire);
                     let cur_header = cur_block.base.header.load(Relaxed);
