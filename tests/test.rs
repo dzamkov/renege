@@ -17,6 +17,18 @@ fn test_3_cond() {
 }
 
 #[test]
+fn test_invalid_at_construction() {
+    let a = Condition::new();
+    assert!(!(a.token() & Token::never()).is_valid());
+    let b = Condition::new();
+    let c = Condition::new();
+    let b_token = b.token();
+    drop(b);
+    assert!(!(a.token() & b_token).is_valid());
+    assert!(!(b_token & c.token()).is_valid());
+}
+
+#[test]
 fn test_sensitivity_exhaustive() {
     #[cfg(miri)]
     const NUM_CONDS: usize = 4;

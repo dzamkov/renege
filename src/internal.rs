@@ -18,7 +18,9 @@ impl TokenId {
     pub const ALWAYS: TokenId = TokenId(0);
 
     /// The [`TokenId`] for the unique token which is never valid.
-    pub const NEVER: TokenId = TokenId(1);
+    // Use a high `TokenId` so that this will always be considered as the secondary parent, which
+    // is checked for validity before the primary parent.
+    pub const NEVER: TokenId = TokenId((1 << Self::NUM_BITS) - 1);
 
     /// The maximum number of bits a [`TokenId`] can occupy.
     const NUM_BITS: u8 = 58;
@@ -743,7 +745,8 @@ fn dependent_exact(
 ) -> Token {
     let primary_block = left_block.as_ref();
     let primary_ext_id = left_ext_id;
-    let secondary_block = right_block.as_ref();
+    let secondary_block_ref = right_block;
+    let secondary_block = secondary_block_ref.as_ref();
     let secondary_ext_id = right_ext_id;
 
     // Check whether such a token already exists by searching the secondary dependency tree
@@ -807,8 +810,7 @@ fn dependent_exact(
                     continue;
                 } else {
                     // Token has been invalidated
-                    // TODO: Unlock the secondary token
-                    todo!();
+                    unlock(alloc, secondary_block_ref, secondary_ext_id);
                     return never();
                 }
             }
@@ -936,6 +938,23 @@ fn search_secondary(
                 id: slot_id,
                 block: slot_block,
             });
+        }
+    }
+}
+
+/// Unlocks a [`TokenBlock`], propogating invalidation if needed.
+fn unlock(alloc: &mut ThreadAllocator, block: TokenBlockRef<'static>, ext_id: ExtTokenId) {
+    let header = block.as_ref().header.compare_exchange(
+        TokenBlockHeader::locked(ext_id),
+        TokenBlockHeader::unlocked(ext_id),
+        Release,
+        Relaxed,
+    );
+    match header {
+        Ok(_) => (),
+        Err(header) => {
+            debug_assert!(header.ext_id() != ext_id);
+            todo!()
         }
     }
 }
@@ -1280,7 +1299,7 @@ fn alloc_block<T: Default>(chunk_size: usize, free_blocks: &mut Vec<&'static T>)
             .take(chunk_size)
             .collect::<Vec<_>>()
             .leak();
-        
+
         // Tell miri that the leak is intentional
         #[cfg(miri)]
         {

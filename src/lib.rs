@@ -1,20 +1,52 @@
-//! ```
-//! # use renege::{Token, Condition};
-//! let a = Condition::new();
-//! let b = Condition::new();
-//! let c: Token = a.token() & b.token();
-//! assert!(c.is_valid());
-//! drop(b);
-//! assert!(!c.is_valid());
-//! ```
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
 mod atomic;
 mod internal;
 #[cfg(test)]
 mod test;
 use std::ops::{BitAnd, BitAndAssign};
 
-/// A "validity token" which tracks the validity of a resource, computed value or any other kind
-/// of assumption.
+
+/// A condition that a cache can depend on. Is automatically invalidated when dropped.
+///
+/// ```
+/// # use renege::Condition;
+/// let cond = Condition::new();
+/// let token = cond.token();
+/// assert!(token.is_valid());
+/// drop(cond);
+/// assert!(!token.is_valid());
+/// ```
+pub struct Condition(Token);
+
+impl Condition {
+    /// Creates a new [`Condition`].
+    pub fn new() -> Self {
+        Self(internal::ThreadAllocator::with(internal::source))
+    }
+
+    /// Gets a [`Token`] which is valid for as long as this [`Condition`] is alive.
+    pub fn token(&self) -> Token {
+        self.0
+    }
+}
+
+impl Drop for Condition {
+    fn drop(&mut self) {
+        let Token { block, ext_id } = self.0;
+        internal::ThreadAllocator::with(|alloc| {
+            internal::invalidate_source(alloc, block.as_ref(), ext_id)
+        });
+    }
+}
+
+impl Default for Condition {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Tracks the valdity of an arbitrary set of [`Condition`]s.
 #[derive(Clone, Copy)]
 pub struct Token {
     block: internal::TokenBlockRef<'static>,
@@ -65,44 +97,5 @@ impl BitAnd for Token {
 impl BitAndAssign for Token {
     fn bitand_assign(&mut self, rhs: Self) {
         *self = *self & rhs;
-    }
-}
-
-/// Represents a condition/assumption which is valid only as long as this is alive.
-///
-/// ```
-/// # use renege::Condition;
-/// let cond = Condition::new();
-/// let token = cond.token();
-/// assert!(token.is_valid());
-/// drop(cond);
-/// assert!(!token.is_valid());
-/// ```
-pub struct Condition(Token);
-
-impl Condition {
-    /// Creates a new [`Condition`].
-    pub fn new() -> Self {
-        Self(internal::ThreadAllocator::with(internal::source))
-    }
-
-    /// Gets a [`Token`] which is valid for as long as this [`Condition`] is alive.
-    pub fn token(&self) -> Token {
-        self.0
-    }
-}
-
-impl Drop for Condition {
-    fn drop(&mut self) {
-        let Token { block, ext_id } = self.0;
-        internal::ThreadAllocator::with(|alloc| {
-            internal::invalidate_source(alloc, block.as_ref(), ext_id)
-        });
-    }
-}
-
-impl Default for Condition {
-    fn default() -> Self {
-        Self::new()
     }
 }
