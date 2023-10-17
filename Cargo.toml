@@ -2,3 +2,10 @@
 name = "renege"
 version = "0.1.0"
 edition = "2021"
+authors = ["Dmitry Zamkov <dmitry94@gmail.com>"]
+description = "Tracking cache validity using fast concurrent invalidation propogation."
+repository = "https://github.com/dzamkov/renege"
+license = "MIT OR Apache-2.0"
+keywords = ["cache", "invalidation", "validity", "frp"]
+categories = ["rust-patterns", "data-structures", "concurrency", "caching"]
+readme = "README.md"
