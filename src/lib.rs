@@ -1,11 +1,11 @@
 #![doc = include_str!("../README.md")]
+#![deny(missing_debug_implementations)]
 #![deny(missing_docs)]
 mod atomic;
 mod internal;
 #[cfg(test)]
 mod test;
 use std::ops::{BitAnd, BitAndAssign};
-
 
 /// A condition that a cache can depend on. Is automatically invalidated when dropped.
 ///
@@ -43,6 +43,14 @@ impl Drop for Condition {
 impl Default for Condition {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for Condition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Condition")
+            .field(&internal::TokenId::from(self.0.ext_id).index())
+            .finish()
     }
 }
 
@@ -97,5 +105,20 @@ impl BitAnd for Token {
 impl BitAndAssign for Token {
     fn bitand_assign(&mut self, rhs: Self) {
         *self = *self & rhs;
+    }
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_tuple("Token");
+        let mut deps = Vec::new();
+        if internal::dependencies(*self, |dep| {
+            deps.push(internal::TokenId::from(dep.ext_id).index())
+        }) {
+            d.field(&deps);
+        } else {
+            d.field(&format_args!("<invalid>"));
+        }
+        d.finish()
     }
 }

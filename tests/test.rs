@@ -59,3 +59,27 @@ fn test_sensitivity_exhaustive() {
         }
     }
 }
+
+#[test]
+fn test_debug() {
+    let conds: [Condition; 20] = core::array::from_fn(|_| Condition::new());
+    let mut token = Token::always();
+    let mut cond_ids = Vec::new();
+    assert_eq!(format!("{:?}", token), "Token([])");
+    for cond in [&conds[0], &conds[7], &conds[11], &conds[17]] {
+        let cond_debug = format!("{:?}", cond);
+        let cond_id = cond_debug
+            .strip_prefix("Condition(")
+            .unwrap()
+            .strip_suffix(')')
+            .unwrap()
+            .to_string();
+        cond_ids.push(cond_id);
+        token &= cond.token();
+        assert_eq!(
+            format!("{:?}", token),
+            format!("Token([{}])", cond_ids.join(", "))
+        );
+    }
+    assert_eq!(format!("{:?}", Token::never()), "Token(<invalid>)");
+}

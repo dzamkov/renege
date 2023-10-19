@@ -31,6 +31,11 @@ impl TokenId {
         assert!(index < (1 << Self::NUM_BITS));
         Self(index)
     }
+
+    /// Gets the index of this [`TokenId`].
+    pub fn index(&self) -> u64 {
+        self.0
+    }
 }
 
 unsafe impl PrimRepr for TokenId {
@@ -1210,6 +1215,41 @@ fn invalidate_secondary(
 
             // Free the block
             alloc.free_dependent_tree_block(block);
+        }
+    }
+}
+
+/// Iterates over all source [`Token`]s that a given [`Token`] is dependent on, or returns
+/// `false` if the token is invalid. This may return `false` even after some tokens have been
+/// returned.
+pub fn dependencies(token: Token, mut f: impl FnMut(Token)) -> bool {
+    return if token.ext_id == ExtTokenId::ALWAYS {
+        true
+    } else {
+        inner(token, &mut f)
+    };
+    fn inner(token: Token, f: &mut impl FnMut(Token)) -> bool {
+        if let Some(block) = token.dependent_block() {
+            if let Some(info) = block.dependent_info(token.ext_id.into()) {
+                if let Some(left) = info.left_parent.token() {
+                    if !inner(left, f) {
+                        return false;
+                    }
+                }
+                if let Some(right) = info.right_parent.token() {
+                    if !inner(right, f) {
+                        return false;
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        } else if is_valid(token) {
+            f(token);
+            true
+        } else {
+            false
         }
     }
 }
