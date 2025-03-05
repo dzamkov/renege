@@ -59,7 +59,7 @@ impl ExtTokenId {
 
     /// Constructs an [`ExtTokenId`] from the given [`TokenId`] and `is_dependent` value.
     pub const fn new(id: TokenId, is_dependent: bool) -> Self {
-        ExtTokenId(id.0 | (is_dependent as u64) << TokenId::NUM_BITS)
+        ExtTokenId(id.0 | ((is_dependent as u64) << TokenId::NUM_BITS))
     }
 
     /// Indicates whether this [`ExtTokenId`] is for a dependent token.
@@ -150,20 +150,22 @@ impl TokenBlockHeader {
     /// A header indicating a dependent token has been invalidated from the primary dependency
     /// list.
     pub const INVALID_DEP_PRIMARY: TokenBlockHeader = TokenBlockHeader(
-        (TokenBlockState::InvalidPrimary as u64) << ExtTokenId::NUM_BITS | 1 << TokenId::NUM_BITS,
+        ((TokenBlockState::InvalidPrimary as u64) << ExtTokenId::NUM_BITS)
+            | (1 << TokenId::NUM_BITS),
     );
 
     /// A header indicating a dependent token has been invalidated from the secondary dependency
     /// tree, but not the primary dependency list.
     pub const INVALID_DEP_SECONDARY: TokenBlockHeader = TokenBlockHeader(
-        (TokenBlockState::InvalidSecondary as u64) << ExtTokenId::NUM_BITS | 1 << TokenId::NUM_BITS,
+        ((TokenBlockState::InvalidSecondary as u64) << ExtTokenId::NUM_BITS)
+            | (1 << TokenId::NUM_BITS),
     );
 
     /// A header indicating a dependent token is being invalidated from the secondary dependency
     /// tree, but not the primary dependency list.
     pub const INVALIDATING_DEP_SECONDARY: TokenBlockHeader = TokenBlockHeader(
-        (TokenBlockState::InvalidatingSecondary as u64) << ExtTokenId::NUM_BITS
-            | 1 << TokenId::NUM_BITS,
+        ((TokenBlockState::InvalidatingSecondary as u64) << ExtTokenId::NUM_BITS)
+            | (1 << TokenId::NUM_BITS),
     );
 
     /// Constructs a header for a token that is unlocked and valid.
@@ -401,7 +403,11 @@ impl Token {
             // SAFETY: Since the dependent flag is set, the token must be dependent. Thus,
             // `self.block` is the `base` for a `DependentTokenBlock`. Due to the layout required
             // by `repr(C)`, this should be at the same location as the outer block.
-            Some(unsafe { std::mem::transmute(self.block) })
+            Some(unsafe {
+                std::mem::transmute::<TokenBlockRef<'static>, &'static DependentTokenBlock>(
+                    self.block,
+                )
+            })
         } else {
             None
         }
@@ -1264,13 +1270,15 @@ pub struct ThreadAllocator {
 }
 
 thread_local! {
-    static ALLOC: RefCell<ThreadAllocator> = RefCell::new(ThreadAllocator {
-        next_token_id: 0,
-        last_reserved_token_id: 0,
-        free_source_token_blocks: Vec::new(),
-        free_dependent_token_blocks: Vec::new(),
-        free_dependent_tree_blocks: Vec::new(),
-    });
+    static ALLOC: RefCell<ThreadAllocator> = const {
+        RefCell::new(ThreadAllocator {
+            next_token_id: 0,
+            last_reserved_token_id: 0,
+            free_source_token_blocks: Vec::new(),
+            free_dependent_token_blocks: Vec::new(),
+            free_dependent_tree_blocks: Vec::new(),
+        })
+    };
 }
 
 impl ThreadAllocator {
@@ -1343,8 +1351,8 @@ fn alloc_block<T: Default>(chunk_size: usize, free_blocks: &mut Vec<&'static T>)
         // Tell miri that the leak is intentional
         #[cfg(miri)]
         {
-            extern "Rust" {
-                fn miri_static_root(ptr: *const u8);
+            unsafe extern "Rust" {
+                unsafe fn miri_static_root(ptr: *const u8);
             }
             unsafe {
                 miri_static_root(chunk.as_ptr().cast::<_>());

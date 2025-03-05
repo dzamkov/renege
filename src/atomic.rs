@@ -107,21 +107,21 @@ pub trait HasAtomic {
 
 impl HasAtomic for u64 {
     unsafe fn atomic_load(ptr: *mut u64, order: Ordering) -> u64 {
-        (*(ptr as *mut AtomicU64)).load(order)
+        unsafe { (*(ptr as *mut AtomicU64)).load(order) }
     }
 
     unsafe fn atomic_store(ptr: *mut u64, val: u64, order: Ordering) {
-        (*(ptr as *mut AtomicU64)).store(val, order)
+        unsafe { (*(ptr as *mut AtomicU64)).store(val, order) }
     }
 }
 
 impl<T> HasAtomic for NonNull<T> {
     unsafe fn atomic_load(ptr: *mut Self, order: Ordering) -> Self {
-        NonNull::new((*(ptr as *mut AtomicPtr<T>)).load(order)).unwrap_unchecked()
+        unsafe { NonNull::new((*(ptr as *mut AtomicPtr<T>)).load(order)).unwrap_unchecked() }
     }
 
     unsafe fn atomic_store(ptr: *mut Self, val: Self, order: Ordering) {
-        (*(ptr as *mut AtomicPtr<T>)).store(val.as_ptr(), order)
+        unsafe { (*(ptr as *mut AtomicPtr<T>)).store(val.as_ptr(), order) }
     }
 }
 

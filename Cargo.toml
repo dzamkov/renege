@@ -1,7 +1,7 @@
 [package]
 name = "renege"
 version = "0.1.2"
-edition = "2021"
+edition = "2024"
 authors = ["Dmitry Zamkov <dmitry94@gmail.com>"]
 description = "Tracking cache validity using fast concurrent invalidation propogation."
 repository = "https://github.com/dzamkov/renege"
