@@ -83,3 +83,96 @@ fn test_debug() {
     }
     assert_eq!(format!("{:?}", Token::never()), "Token(<invalid>)");
 }
+
+#[test]
+fn test_multithreaded_basic() {
+    // Verify the basic guarantee of the library in a multithreaded context:
+    // If thread A invalidates a condition, and then performs a write X, then if thread B
+    // observes X, it must also observe that the condition is invalid.
+    #[cfg(miri)]
+    const NUM_ITERS: u64 = 10;
+    #[cfg(not(miri))]
+    const NUM_ITERS: u64 = 1000;
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..NUM_ITERS {
+            let tx = tx.clone();
+            s.spawn(move || {
+                println!("Thread {} starting", i);
+                let value = std::sync::Arc::new(std::sync::Mutex::new("Good".to_string()));
+                let cond = Condition::new();
+                #[cfg(not(miri))]
+                std::thread::sleep(std::time::Duration::from_millis(100 + i));
+                tx.send((value.clone(), cond.token())).unwrap();
+                println!("Thread {} sent payload", i);
+                #[cfg(not(miri))]
+                std::thread::sleep(std::time::Duration::from_millis(i % 10));
+                drop(cond);
+                *value.lock().unwrap() = format!("Bad({})", i);
+                println!("Thread {} ending", i);
+            });
+        }
+        drop(tx);
+        while let Ok((value, token)) = rx.recv() {
+            let value = value.lock().unwrap().clone();
+            if token.is_valid() {
+                assert_eq!(value, "Good");
+                println!("Observed valid");
+            } else {
+                println!("Ignored invalid: {}", value);
+            }
+        }
+    });
+}
+
+#[test]
+fn test_multithreaded_combine() {
+    #[cfg(miri)]
+    const NUM_ITERS: u64 = 10;
+    #[cfg(not(miri))]
+    const NUM_ITERS: u64 = 1000;
+    std::thread::scope(|s| {
+        let any_valid = Condition::new();
+        let any_valid_token = any_valid.token();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..NUM_ITERS {
+            let tx = tx.clone();
+            s.spawn(move || {
+                println!("Thread {} starting", i);
+                let value = std::sync::Arc::new(std::sync::Mutex::new("Good".to_string()));
+                let cond = Condition::new();
+                #[cfg(not(miri))]
+                std::thread::sleep(std::time::Duration::from_millis(100 + i));
+                tx.send((value.clone(), any_valid_token & cond.token())).unwrap();
+                println!("Thread {} sent payload", i);
+                #[cfg(not(miri))]
+                std::thread::sleep(std::time::Duration::from_millis(i % 10));
+                if i % 4 == 0 {
+                    std::mem::forget(cond);
+                } else {
+                    drop(cond);
+                    *value.lock().unwrap() = format!("Bad({})", i);
+                }
+                println!("Thread {} ending", i);
+            });
+        }
+        drop(tx);
+        let mut tokens = Vec::new();
+        while let Ok((value, token)) = rx.recv() {
+            let value = value.lock().unwrap().clone();
+            if token.is_valid() {
+                assert_eq!(value, "Good");
+                println!("Observed valid");
+                tokens.push(token);
+            } else {
+                println!("Ignored invalid: {}", value);
+            }
+        }
+        println!("Invalidating all tokens");
+        drop(any_valid);
+        println!("Ensuring remaining {} tokens are invalid", tokens.len());
+        for token in tokens {
+            assert!(!token.is_valid());
+        }
+    });
+}
