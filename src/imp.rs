@@ -1246,7 +1246,6 @@ fn finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     while let Some(first_child) = opt_first_child {
         // Verify that this is still a left child of `block`.
         let first_child = first_child.token();
-        #[cfg(debug_assertions)]
         let first_child_prev_sibling = first_child
             .block
             .token_footer()
