@@ -4,13 +4,12 @@
 mod atomic;
 #[cfg(test)]
 mod test;
-use crate::atomic::Atomic;
-use atomic::HasAtomic;
+use atomic::{Atomic, HasAtomic};
+use atomic::Ordering::{Acquire, Relaxed, Release};
+use atomic::{AtomicUsize, AtomicPtr, fence};
 use std::cell::RefCell;
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::mem::ManuallyDrop;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicPtr, AtomicUsize, fence};
 
 /// A condition that a cache can depend on. Is automatically invalidated when dropped.
 ///
