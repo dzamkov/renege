@@ -1,5 +1,8 @@
 use crate::{Token, Condition};
-use crate::imp::token_eq;
+
+fn token_eq(a: Token, b: Token) -> bool {
+    crate::imp::token_eq(a.into(), b.into())
+}
 
 #[test]
 fn test_dedup_always() {
