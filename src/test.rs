@@ -1,25 +1,7 @@
-use crate::internal::*;
 use crate::*;
 
-#[test]
-fn test_dep_range_between() {
-    let scale_and_split = |dep: DependentRange| (dep.scale(), dep.split());
-    assert_eq!(
-        scale_and_split(DependentRange::between(TokenId::new(1), TokenId::new(2))),
-        (1, TokenId::new(2))
-    );
-    assert_eq!(
-        scale_and_split(DependentRange::between(TokenId::new(1), TokenId::new(3))),
-        (1, TokenId::new(2))
-    );
-    assert_eq!(
-        scale_and_split(DependentRange::between(TokenId::new(7), TokenId::new(9))),
-        (3, TokenId::new(8))
-    );
-}
-
 fn token_eq(a: Token, b: Token) -> bool {
-    std::ptr::eq(a.block.as_ref(), b.block.as_ref()) && a.ext_id == b.ext_id
+    std::ptr::eq(a.block, b.block) && a.max_tag == b.max_tag
 }
 
 #[test]
@@ -54,4 +36,60 @@ fn test_dedup_complex() {
     assert!(token_eq(t_0, t_1));
     assert!(token_eq(t_0, t_2));
     assert!(token_eq(t_0, t_3));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_multithreaded_construct() {
+    use rand::{Rng, SeedableRng};
+    const NUM_CONDS: usize = 50;
+    const NUM_DEPS: usize = 10;
+    const NUM_THREADS: usize = 1000;
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(1);
+    let conds = (0..NUM_CONDS).map(|_| Condition::new()).collect::<Box<_>>();
+    let deps = (0..NUM_THREADS)
+        .map(|_| {
+            // This may cause a condition to appear multiple times, but that's okay because we
+            // also want to test deduplication
+            (0..NUM_DEPS)
+                .map(|_| rng.random_range(0..NUM_CONDS))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Box<_>>();
+
+    // Create combined tokens on separate threads
+    let barrier = std::sync::Barrier::new(NUM_THREADS);
+    let tokens = std::thread::scope(|s| {
+        let barrier = &barrier;
+        let res = deps
+            .iter()
+            .map(|deps| {
+                let mut local_rng = rand::rngs::SmallRng::seed_from_u64(rng.random());
+                let mut tokens = deps.iter().map(|&i| conds[i].token()).collect::<Vec<_>>();
+                s.spawn(move || {
+                    // Wait until all threads are ready
+                    barrier.wait();
+
+                    // Combine tokens randomly
+                    while tokens.len() > 1 {
+                        let a = tokens.swap_remove(local_rng.random_range(0..tokens.len()));
+                        let b = tokens.swap_remove(local_rng.random_range(0..tokens.len()));
+                        tokens.push(a & b);
+                    }
+                    (deps, tokens.pop().unwrap())
+                })
+            })
+            .collect::<Vec<_>>();
+        res.into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    // Verify the tokens were constructed correctly
+    for (deps, act_token) in tokens {
+        let exp_token = deps
+            .iter()
+            .fold(Token::always(), |acc, &i| acc & conds[i].token());
+        assert!(token_eq(act_token, exp_token));
+    }
 }

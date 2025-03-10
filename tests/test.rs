@@ -86,9 +86,6 @@ fn test_debug() {
 
 #[test]
 fn test_multithreaded_basic() {
-    // Verify the basic guarantee of the library in a multithreaded context:
-    // If thread A invalidates a condition, and then performs a write X, then if thread B
-    // observes X, it must also observe that the condition is invalid.
     #[cfg(miri)]
     const NUM_ITERS: u64 = 10;
     #[cfg(not(miri))]
@@ -107,7 +104,7 @@ fn test_multithreaded_basic() {
                 println!("Thread {} sent payload", i);
                 #[cfg(not(miri))]
                 std::thread::sleep(std::time::Duration::from_millis(i % 10));
-                drop(cond);
+                cond.invalidate_immediately();
                 *value.lock().unwrap() = format!("Bad({})", i);
                 println!("Thread {} ending", i);
             });
@@ -150,7 +147,7 @@ fn test_multithreaded_combine() {
                 if i % 4 == 0 {
                     std::mem::forget(cond);
                 } else {
-                    drop(cond);
+                    cond.invalidate_immediately();
                     *value.lock().unwrap() = format!("Bad({})", i);
                 }
                 println!("Thread {} ending", i);
@@ -169,7 +166,7 @@ fn test_multithreaded_combine() {
             }
         }
         println!("Invalidating all tokens");
-        drop(any_valid);
+        any_valid.invalidate_immediately();
         println!("Ensuring remaining {} tokens are invalid", tokens.len());
         for token in tokens {
             assert!(!token.is_valid());
