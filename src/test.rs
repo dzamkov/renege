@@ -1,8 +1,5 @@
-use crate::*;
-
-fn token_eq(a: Token, b: Token) -> bool {
-    std::ptr::eq(a.block, b.block) && a.max_tag == b.max_tag
-}
+use crate::{Token, Condition};
+use crate::imp::token_eq;
 
 #[test]
 fn test_dedup_always() {
