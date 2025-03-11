@@ -205,8 +205,7 @@ impl<'alloc> Token<'alloc> {
 
     /// Indicates whether this token will always be valid.
     pub fn is_always_valid(&self) -> bool {
-        let always = Self::always();
-        std::ptr::eq(self.block, always.block) && self.max_tag == always.max_tag
+        self == &Self::always()
     }
 }
 
@@ -532,9 +531,7 @@ impl std::fmt::Debug for Block<'_> {
     }
 }
 
-/// A unique identifier for a [`Condition`].
-///
-/// Even after a condition is invalidated, its identifier will never be re-used.
+/// A unique identifier for a [`Condition`] within a certain context.
 #[repr(transparent)]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy, Hash)]
 pub struct ConditionId(usize);

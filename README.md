@@ -28,7 +28,7 @@ the cache depends on. If any are false, the cache is invalid.
 	* **Pros:** Simple and easy to implement
 
 	* **Cons:** Tends to be slow, especially if there are many conditions and/or they are expensive
-	to check. The performance penalty of the checks might even outweigh the benefits of the cache
+	to check. The performance penalty of the checks might even outweigh the benefits of the cache!
 
 * **Push-based:** When a condition becomes false, caches that depend on it are marked as invalid.
 
@@ -68,3 +68,17 @@ drop(water_is_wet);
 // Use .is_valid() to check if all of the Conditions a Token depends on are still valid
 assert!(!normality.is_valid());
 ```
+
+## Features
+
+* `Token::is_valid()` is extremely fast, requiring just a single atomic read, regardless of how
+many conditions it's tracking.
+
+* **Fully concurrent:** `Condition`s and `Token`s can freely be sent between threads. Invalidations
+on one thread will propogate to all other threads. All common operations are
+[lock-free](https://en.wikipedia.org/wiki/Non-blocking_algorithm).
+
+* Aggressive deduplication ensures that at most one `Token` is created for a given set of
+`Condition`s, regardless of how and where it is constructed. e.g. Assuming `a`, `b`, and `c` are
+all tokens, one thread can build `(a & b) & (b & c)` while another thread builds `a & b & c`,
+and they will both end up with the same `Token` sharing the same underlying storage.
