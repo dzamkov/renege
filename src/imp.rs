@@ -6,7 +6,7 @@ use std::cmp::Ordering::{Equal, Greater, Less};
 use std::mem::ManuallyDrop;
 
 /// A condition that a cache can depend on.
-/// 
+///
 /// The backing storage used by the condition has a lifetime of `'alloc` and is managed by
 /// explicitly-provided [`Allocator`]s. Note that, unlike the top-level [`crate::Condition`], this
 /// is not automatically invalidated when dropped because an [`Allocator`] is needed to perform
@@ -19,8 +19,11 @@ pub struct Condition<'alloc> {
 
 impl<'alloc> Condition<'alloc> {
     /// Creates a new [`Condition`] using the given [`Allocator`].
-    pub fn new<Alloc: Allocator<'alloc> + ?Sized>(alloc: &mut Alloc) -> Self {
-        let id = alloc.allocate_condition_id();
+    ///
+    /// There should not be any live [`Condition`]s with the same [`ConditionId`] and backing
+    /// storage. For best performance, [`ConditionId`]s should be assigned in roughly increasing
+    /// order, so the age of a [`Condition`] can be approximated by its [`ConditionId`].
+    pub fn new<Alloc: Allocator<'alloc> + ?Sized>(alloc: &mut Alloc, id: ConditionId) -> Self {
         let block = alloc.allocate_block();
 
         // Relaxed memory order is sufficient here because the block won't be visible to
@@ -77,11 +80,24 @@ impl<'alloc> Condition<'alloc> {
         invalidate_condition(alloc, block);
     }
 
+    /// Gets the [`ConditionId`] for this [`Condition`].
+    pub fn id(&self) -> ConditionId {
+        self.block.range.load(Relaxed).min()
+    }
+
     /// Gets a [`Token`] which is valid for as long as this [`Condition`] is alive.
     pub fn token(&self) -> Token<'alloc> {
         self.block.token()
     }
 }
+
+impl PartialEq for Condition<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.block, other.block)
+    }
+}
+
+impl Eq for Condition<'_> {}
 
 impl std::fmt::Debug for Condition<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -91,7 +107,7 @@ impl std::fmt::Debug for Condition<'_> {
 }
 
 /// Tracks the validity of an arbitrary set of [`Condition`]s.
-/// 
+///
 /// The backing storage used by the token has a lifetime of `'alloc` and is managed by
 /// explicitly-provided [`Allocator`]s.
 #[derive(Clone, Copy)]
@@ -107,7 +123,7 @@ impl<'alloc> Token<'alloc> {
     /// Gets a token which is always valid. This is the [`Default`] token.
     ///
     /// # Examples
-    /// 
+    ///
     /// ```
     /// # use renege::Token;
     /// assert!(Token::always().is_valid())
@@ -125,7 +141,7 @@ impl<'alloc> Token<'alloc> {
     }
 
     /// Gets a token which is never valid.
-    /// 
+    ///
     /// # Examples
     ///
     /// ```
@@ -488,20 +504,30 @@ impl std::fmt::Debug for Block<'_> {
 ///
 /// Even after a condition is invalidated, its identifier will never be re-used.
 #[repr(transparent)]
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy, Hash)]
 pub struct ConditionId(usize);
 
 impl ConditionId {
     /// The maximum number of bits a [`ConditionId`] can occupy.
     const NUM_BITS: u32 = usize::BITS - usize::BITS.ilog2();
 
-    /// The maximum possible [`ConditionId`].
-    pub const MAX: Self = Self((1 << Self::NUM_BITS) - 1);
+    /// The maximum index for a [`ConditionId`].
+    pub const MAX_INDEX: usize = (1 << Self::NUM_BITS) - 1;
 
-    /// Constructs a [`ConditionId`] with the given index.
+    /// The maximum [`ConditionId`].
+    pub const MAX: ConditionId = Self(Self::MAX_INDEX);
+
+    /// Constructs a [`ConditionId`] from the given index.
+    ///
+    /// The index must not be greater than  [`Self::MAX_INDEX`], or this will panic.
     pub const fn new(index: usize) -> Self {
-        assert!(index < (1 << Self::NUM_BITS));
+        assert!(index <= Self::MAX_INDEX);
         Self(index)
+    }
+
+    /// Gets the index of this [`ConditionId`].
+    pub const fn index(self) -> usize {
+        self.0
     }
 }
 
@@ -522,10 +548,10 @@ impl ConditionRange {
 
     /// Gets the smallest [`ConditionRange`] which fully contains both of the given ranges.
     pub fn combine(a: Self, b: Self) -> Self {
-        let mask = (a.0 ^ b.0) & ConditionId::MAX.0;
+        let mask = (a.0 ^ b.0) & ConditionId::MAX_INDEX;
         let scale = usize::BITS - mask.leading_zeros();
         Self(
-            (((scale as usize) << ConditionId::NUM_BITS) | (a.0 & ConditionId::MAX.0))
+            (((scale as usize) << ConditionId::NUM_BITS) | (a.0 & ConditionId::MAX_INDEX))
                 .max(a.0)
                 .max(b.0)
                 & !((1 << scale) - 1),
@@ -545,7 +571,7 @@ impl ConditionRange {
 
     /// Gets the smallest [`ConditionId`] in this range.
     pub const fn min(self) -> ConditionId {
-        ConditionId(self.0 & ConditionId::MAX.0)
+        ConditionId(self.0 & ConditionId::MAX_INDEX)
     }
 
     /// Gets the [`ConditionRangeRelation`] between this range and another.

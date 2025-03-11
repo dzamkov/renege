@@ -3,7 +3,7 @@
 pub use crate::imp::{Block, Condition, ConditionId, Token};
 pub use global::Global;
 
-/// An allocator for [`Block`]s and [`ConditionId`]s used by [`Token`]s and [`Condition`]s.
+/// An allocator for [`Block`]s used by [`Token`]s and [`Condition`]s.
 ///
 /// An individual [`Allocator`] will only be used by a single thread, but there may be multiple
 /// co-existing [`Allocator`]s which allocate to the same backing storage. The `'alloc` lifetime
@@ -13,15 +13,6 @@ pub use global::Global;
 /// [`Allocator::free_block`] is called), so the backing storage can't shrink: it must be
 /// dropped all at once, along with all [`Token`]s and [`Condition`]s which use it.
 pub trait Allocator<'alloc> {
-    /// Allocates a new [`ConditionId`].
-    ///
-    /// It is guaranteed that the returned [`ConditionId`] is distinct from all [`ConditionId`]s
-    /// associated with the same `'alloc` lifetime.
-    /// 
-    /// For best performance, [`ConditionId`]s should be allocated in roughly increasing order.
-    /// That way, the age of a [`Condition`]s can be approximated by its [`ConditionId`].
-    fn allocate_condition_id(&mut self) -> ConditionId;
-
     /// Allocates a new [`Block`].
     fn allocate_block(&mut self) -> &'alloc Block<'alloc>;
 
@@ -74,11 +65,9 @@ mod global {
         pub fn with<R>(f: impl FnOnce(&mut Global) -> R) -> R {
             ALLOC.with(|cell| f(&mut cell.borrow_mut()))
         }
-    }
 
-    impl Allocator<'static> for Global {
         /// Gets an unused [`ConditionId`].
-        fn allocate_condition_id(&mut self) -> ConditionId {
+        pub fn allocate_condition_id(&mut self) -> ConditionId {
             if self.next_cond_index < self.last_reserved_cond_index {
                 let res = self.next_cond_index;
                 self.next_cond_index += 1;
@@ -90,7 +79,9 @@ mod global {
                 ConditionId::new(res)
             }
         }
+    }
 
+    impl Allocator<'static> for Global {
         /// Gets an unused [`Block`].
         fn allocate_block(&mut self) -> &'static Block<'static> {
             if let Some(res) = self.free_blocks.pop() {

@@ -36,7 +36,10 @@ mod global {
     impl Condition {
         /// Creates a new [`Condition`].
         pub fn new() -> Self {
-            Self(alloc::Global::with(alloc::Condition::new))
+            Self(alloc::Global::with(|global| {
+                let id = global.allocate_condition_id();
+                alloc::Condition::new(global, id)
+            }))
         }
 
         /// Invalidates this [`Condition`] "immediately".
