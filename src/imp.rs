@@ -3,7 +3,7 @@ use crate::atomic::{Atomic, HasAtomic};
 use crate::atomic::{AtomicPtr, AtomicUsize, fence};
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::mem::ManuallyDrop;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 
 /// A condition that a cache can depend on.
 ///
@@ -468,7 +468,7 @@ impl<'a> Atomic<SiblingBlockRef<'a>> {
 
 impl<'alloc> Block<'alloc> {
     /// Creates a new empty [`Block`].
-    /// 
+    ///
     /// This can be used by an [`Allocator`] to create additional blocks.
     pub fn new() -> Self {
         Self {
@@ -1198,8 +1198,9 @@ fn hold(token: Token) -> Option<BlockGuard> {
 fn unhold<'alloc, Alloc: Allocator<'alloc> + ?Sized>(alloc: &mut Alloc, guard: BlockGuard<'alloc>) {
     let block = guard.block;
     std::mem::forget(guard);
-    let o_tag = block.tag.0.fetch_sub(1, Relaxed);
-    if o_tag & !BlockTag::VERSION_MASK == BlockTag::INVALID_BIT {
+    let o_tag = block.tag.0.fetch_sub(1, AcqRel); // Synchronizes with token unhold
+    debug_assert!(o_tag & BlockTag::HOLD_MASK > 0);
+    if o_tag & !BlockTag::VERSION_MASK == (BlockTag::INVALID_BIT + 1) {
         fence(Release); // Synchronizes with token invalidation
         // We were the last holder of an invalid block, so it's our responsibility to finalize it.
         finalize(alloc, block);
@@ -1221,10 +1222,11 @@ fn invalidate_token<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
             .block
             .tag
             .0
-            .compare_exchange_weak(tag, n_tag, Relaxed, Relaxed)
+            .compare_exchange_weak(tag, n_tag, Acquire, Relaxed) // Synchronizes with token unhold
         {
             Ok(_) => {
                 if tag & BlockTag::HOLD_MASK == 0 {
+                    fence(Release); // Synchronizes with token invalidation
                     // There are no holders on the block, so we can finalize it.
                     finalize(alloc, token.block);
                     return true;
@@ -1251,7 +1253,7 @@ fn invalidate_condition<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     alloc: &mut Alloc,
     block: &'alloc Block<'alloc>,
 ) {
-    let o_tag = block.tag.0.fetch_or(BlockTag::INVALID_BIT, Relaxed);
+    let o_tag = block.tag.0.fetch_or(BlockTag::INVALID_BIT, Acquire); // Synchronizes with token unhold
     debug_assert!(o_tag & BlockTag::INVALID_BIT == 0);
     if o_tag & !BlockTag::VERSION_MASK == 0 {
         fence(Release); // Synchronizes with token invalidation
