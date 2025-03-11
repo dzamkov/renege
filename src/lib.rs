@@ -1,15 +1,15 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_debug_implementations)]
-#![deny(missing_docs)]
+#![cfg_attr(not(loom), deny(missing_docs))]
 pub mod alloc;
 mod atomic;
 mod imp;
-#[cfg(test)]
-mod test;
 
+#[cfg(not(loom))]
 pub use global::{Condition, Token};
 
 /// Contains specialized types that use the global allocator.
+#[cfg(not(loom))]
 mod global {
     use crate::alloc;
 
@@ -31,6 +31,7 @@ mod global {
     /// synchronization/ordering of operations, use [`Condition::invalidate_immediately`] or
     /// [`Condition::invalidate_eventually`] instead.
     #[repr(transparent)]
+    #[derive(PartialEq, Eq)]
     pub struct Condition(alloc::Condition<'static>);
 
     impl Condition {
@@ -101,7 +102,7 @@ mod global {
     }
 
     /// Tracks the validity of an arbitrary set of [`Condition`]s.
-    #[derive(Clone, Copy)]
+    #[derive(PartialEq, Eq, Clone, Copy)]
     pub struct Token(alloc::Token<'static>);
 
     impl Token {

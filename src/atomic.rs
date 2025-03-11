@@ -1,8 +1,9 @@
 //! This module contains helper types and functions for working with atomic values.
 #[cfg(not(loom))]
-pub use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
+pub use std::sync::atomic::{AtomicPtr, AtomicUsize, fence};
 #[cfg(loom)]
-pub use loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
+pub use loom::sync::atomic::{AtomicPtr, AtomicUsize, fence};
+use std::sync::atomic::Ordering;
 
 /// A wrapper over a value of type `T` which permits interior mutability using atomic operations.
 #[repr(transparent)]
@@ -49,6 +50,7 @@ unsafe impl<T> HasAtomic for Option<&'_ T> {
 /// An atomic primitive type.
 pub trait IsAtomic {
     type Prim: HasAtomic<Prim = Self::Prim, Atomic = Self>;
+    fn new(value: Self::Prim) -> Self;
     fn load(&self, order: Ordering) -> Self::Prim;
     fn store(&self, val: Self::Prim, order: Ordering);
     fn compare_exchange(
@@ -69,6 +71,9 @@ pub trait IsAtomic {
 
 impl IsAtomic for AtomicUsize {
     type Prim = usize;
+    fn new(value: Self::Prim) -> Self {
+        Self::new(value)
+    }
     fn load(&self, order: Ordering) -> usize {
         self.load(order)
     }
@@ -97,6 +102,9 @@ impl IsAtomic for AtomicUsize {
 
 impl<T> IsAtomic for AtomicPtr<T> {
     type Prim = *mut T;
+    fn new(value: Self::Prim) -> Self {
+        Self::new(value)
+    }
     fn load(&self, order: Ordering) -> Self::Prim {
         self.load(order)
     }
@@ -125,8 +133,8 @@ impl<T> IsAtomic for AtomicPtr<T> {
 
 impl<T: HasAtomic> Atomic<T> {
     /// Constructs an [`Atomic`] wrapper over the given value.
-    pub const fn new(value: T) -> Self {
-        Self(unsafe { std::mem::transmute_copy(&value) })
+    pub fn new(value: T) -> Self {
+        Self(T::Atomic::new(T::into_prim(value)))
     }
 
     /// Loads a value from the [`Atomic`].
@@ -167,5 +175,23 @@ impl<T: HasAtomic> Atomic<T> {
             .compare_exchange_weak(T::into_prim(current), T::into_prim(new), success, failure)
             .map(|prim| unsafe { T::from_prim(prim) })
             .map_err(|prim| unsafe { T::from_prim(prim) })
+    }
+}
+
+#[cfg(not(loom))]
+impl<T: HasAtomic<Prim = usize, Atomic = AtomicUsize>> Atomic<T> {
+    /// Constructs an [`Atomic`] wrapper over the given primitive value.
+    /// 
+    /// Unlike [`Atomic::new`], this is `const`.
+    pub const fn from_prim(value: usize) -> Self {
+        Self(AtomicUsize::new(value))
+    }
+}
+
+#[cfg(not(loom))]
+impl<Ptr: HasAtomic<Prim = *mut T, Atomic = AtomicPtr<T>>, T> Atomic<Ptr> {
+    /// Constructs an [`Atomic`] wrapper over the null pointer.
+    pub const fn null() -> Self {
+        Self(AtomicPtr::new(std::ptr::null_mut()))
     }
 }

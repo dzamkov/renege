@@ -1,9 +1,9 @@
 use crate::alloc::Allocator;
-use crate::atomic::Ordering::{Acquire, Relaxed, Release};
 use crate::atomic::{Atomic, HasAtomic};
 use crate::atomic::{AtomicPtr, AtomicUsize, fence};
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::mem::ManuallyDrop;
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 /// A condition that a cache can depend on.
 ///
@@ -128,11 +128,22 @@ impl<'alloc> Token<'alloc> {
     /// # use renege::Token;
     /// assert!(Token::always().is_valid())
     /// ```
+    #[cfg(not(loom))]
     pub const fn always() -> Self {
+        Self::always_inner(&ALWAYS_NEVER)
+    }
+
+    #[cfg(loom)]
+    pub fn always() -> Self {
+        Self::always_inner(&ALWAYS_NEVER)
+    }
+
+    /// Implementation of [`Token::always`] given the [`ALWAYS_NEVER`] block.
+    const fn always_inner(always_never: &'static Block<'static>) -> Self {
         // SAFETY: All of the references inside of `ALWAYS_NEVER` will always be `None`, so
         // it can safely be interpreted as having any `'alloc` lifetime.
         let block = unsafe {
-            std::mem::transmute::<&'alloc Block<'static>, &'alloc Block<'alloc>>(&ALWAYS_NEVER)
+            std::mem::transmute::<&'alloc Block<'static>, &'alloc Block<'alloc>>(always_never)
         };
         Self {
             block,
@@ -148,11 +159,22 @@ impl<'alloc> Token<'alloc> {
     /// # use renege::Token;
     /// assert!(!Token::never().is_valid())
     /// ```
+    #[cfg(not(loom))]
     pub const fn never() -> Self {
+        Self::never_inner(&ALWAYS_NEVER)
+    }
+
+    #[cfg(loom)]
+    pub fn never() -> Self {
+        Self::never_inner(&ALWAYS_NEVER)
+    }
+
+    /// Implementation of [`Token::never`] given the [`ALWAYS_NEVER`] block.
+    const fn never_inner(always_never: &'static Block<'static>) -> Self {
         // SAFETY: All of the references inside of `ALWAYS_NEVER` will always be `None`, so
         // it can safely be interpreted as having any `'alloc` lifetime.
         let block = unsafe {
-            std::mem::transmute::<&'alloc Block<'static>, &'alloc Block<'alloc>>(&ALWAYS_NEVER)
+            std::mem::transmute::<&'alloc Block<'static>, &'alloc Block<'alloc>>(always_never)
         };
         Self {
             block,
@@ -188,17 +210,19 @@ impl<'alloc> Token<'alloc> {
     }
 }
 
-/// Determines whether two [`Token`]s are defined identically.
-#[cfg(test)]
-pub fn token_eq<'alloc>(a: Token<'alloc>, b: Token<'alloc>) -> bool {
-    std::ptr::eq(a.block, b.block) && a.max_tag == b.max_tag
-}
-
 impl Default for Token<'_> {
     fn default() -> Self {
         Self::always()
     }
 }
+
+impl PartialEq for Token<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.block, other.block) && self.max_tag == other.max_tag
+    }
+}
+
+impl Eq for Token<'_> {}
 
 impl std::fmt::Debug for Token<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -443,8 +467,10 @@ impl<'a> Atomic<SiblingBlockRef<'a>> {
 }
 
 impl<'alloc> Block<'alloc> {
-    /// The default value for a newly-allocated [`Block`].
-    pub const fn default() -> Self {
+    /// Creates a new empty [`Block`].
+    /// 
+    /// This can be used by an [`Allocator`] to create additional blocks.
+    pub fn new() -> Self {
         Self {
             tag: Atomic::new(BlockTag::new(0, true, 0)),
             range: Atomic::new(ConditionRange(0)),
@@ -490,6 +516,12 @@ impl<'alloc> Block<'alloc> {
                 (self.tag.load(Relaxed).0 & BlockTag::VERSION_MASK) | BlockTag::INVALID_BIT,
             ),
         }
+    }
+}
+
+impl Default for Block<'_> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -655,22 +687,43 @@ enum ConditionRangeRelation {
 }
 
 /// A special [`Block`] used to implement the "always" and "never" tokens.
+#[cfg(not(loom))]
 static ALWAYS_NEVER: Block<'static> = Block {
-    tag: Atomic::new(BlockTag::new(1, false, 0)),
+    tag: Atomic::from_prim(BlockTag::new(1, false, 0).0),
     // Use a high range so that this block will always be the "right parent" of a combined
     // token. The right parent is checked for validity before the left parent.
-    range: Atomic::new(ConditionRange::single(ConditionId::MAX)),
-    left_parent: Atomic::new(None),
-    right_parent: Atomic::new(None),
+    range: Atomic::from_prim(ConditionRange::single(ConditionId::MAX).0),
+    left_parent: Atomic::null(),
+    right_parent: Atomic::null(),
     footer: BlockFooter {
         token: std::mem::ManuallyDrop::new(TokenBlockFooter {
-            first_left_child: Atomic::new(None),
-            right_tree: Atomic::new(None),
-            next_left_sibling: Atomic::new(SiblingBlockRef::NONE),
-            prev_left_sibling: Atomic::new(None),
+            first_left_child: Atomic::null(),
+            right_tree: Atomic::null(),
+            next_left_sibling: Atomic::null(),
+            prev_left_sibling: Atomic::null(),
         }),
     },
 };
+
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref ALWAYS_NEVER: Block<'static> = Block {
+        tag: Atomic::new(BlockTag::new(1, false, 0)),
+        // Use a high range so that this block will always be the "right parent" of a combined
+        // token. The right parent is checked for validity before the left parent.
+        range: Atomic::new(ConditionRange::single(ConditionId::MAX)),
+        left_parent: Atomic::new(None),
+        right_parent: Atomic::new(None),
+        footer: BlockFooter {
+            token: std::mem::ManuallyDrop::new(TokenBlockFooter {
+                first_left_child: Atomic::new(None),
+                right_tree: Atomic::new(None),
+                next_left_sibling: Atomic::new(SiblingBlockRef::NONE),
+                prev_left_sibling: Atomic::new(None),
+            }),
+        },
+    };
+}
 
 impl<'alloc> Token<'alloc> {
     /// Gets the left and right parents of a token, or returns [`None`] if the token is invalid or

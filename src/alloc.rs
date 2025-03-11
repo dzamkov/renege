@@ -1,7 +1,6 @@
 //! This module defines alternatives to [`Token`] and [`Condition`] which can use custom allocators
 //! and backing storage.
 pub use crate::imp::{Block, Condition, ConditionId, Token};
-pub use global::Global;
 
 /// An allocator for [`Block`]s used by [`Token`]s and [`Condition`]s.
 ///
@@ -22,7 +21,11 @@ pub trait Allocator<'alloc> {
     fn free_block(&mut self, block: &'alloc Block<'alloc>);
 }
 
+#[cfg(not(loom))]
+pub use global::Global;
+
 /// Contains functionality related to the global allocator.
+#[cfg(not(loom))]
 mod global {
     use crate::alloc::{Allocator, Block, ConditionId};
     #[allow(unused_imports)]
