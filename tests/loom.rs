@@ -115,7 +115,7 @@ fn test_construct() {
 }
 
 #[test]
-fn test_invalidation() {
+fn test_invalidate_simple() {
     loom::model(|| {
         let storage = SharedStorage::new();
         storage.with_static_alloc(|alloc| {
@@ -140,10 +140,36 @@ fn test_invalidation() {
             a.invalidate_eventually(alloc);
             let (_, a_b_token) = b_handle.join().unwrap();
             let (_, a_c_token) = c_handle.join().unwrap();
-            // At this point, we are on the only remaining thread, so all invalidations should
-            // have happened.
+            // At this point, we are on the only remaining thread, so invalidation propogation
+            // should be complete.
             assert!(!a_b_token.is_valid());
             assert!(!a_c_token.is_valid());
-        });
-    });
+        })
+    })
+}
+
+#[test]
+fn test_invalidate_ordering() {
+    loom::model(|| {
+        let storage = SharedStorage::new();
+        storage.with_static_alloc(|alloc| {
+            let a = Condition::new(alloc, ConditionId::new(0));
+            let b = Condition::new(alloc, ConditionId::new(1));
+            let a_token = a.token();
+            let c_handle = {
+                let storage = storage.clone();
+                loom::thread::spawn(move || storage.with_static_alloc(|alloc| {
+                    let c = Condition::new(alloc, ConditionId::new(2));
+                    let a_c_token = Token::combine(alloc, a_token, c.token());
+                    (c, a_c_token)
+                }))
+            };
+            let a_b_token = Token::combine(alloc, a.token(), b.token());
+            assert!(a_b_token.is_valid());
+            a.invalidate_immediately(alloc);
+            assert!(!a_b_token.is_valid());
+            let (_, a_c_token) = c_handle.join().unwrap();
+            assert!(!a_c_token.is_valid())
+        })
+    })
 }

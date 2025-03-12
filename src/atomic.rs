@@ -1,8 +1,8 @@
 //! This module contains helper types and functions for working with atomic values.
 #[cfg(not(loom))]
-pub use std::sync::atomic::{AtomicPtr, AtomicUsize, fence};
+pub use std::sync::atomic::{AtomicPtr, AtomicUsize, AtomicBool, fence};
 #[cfg(loom)]
-pub use loom::sync::atomic::{AtomicPtr, AtomicUsize, fence};
+pub use loom::sync::atomic::{AtomicPtr, AtomicUsize, AtomicBool, fence};
 use std::sync::atomic::Ordering;
 
 /// A wrapper over a value of type `T` which permits interior mutability using atomic operations.

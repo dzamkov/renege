@@ -4,6 +4,7 @@
 pub mod alloc;
 mod atomic;
 mod imp;
+mod util;
 
 #[cfg(not(loom))]
 pub use global::{Condition, Token};
@@ -25,11 +26,6 @@ mod global {
     /// drop(cond);
     /// assert!(!token.is_valid());
     /// ```
-    ///
-    /// Note that the effects of automatic invalidation of a [`Condition`] are not guaranteed to be
-    /// immediately visible in a multi-threaded context. If you have particular requirements for
-    /// synchronization/ordering of operations, use [`Condition::invalidate_immediately`] or
-    /// [`Condition::invalidate_eventually`] instead.
     #[repr(transparent)]
     #[derive(PartialEq, Eq)]
     pub struct Condition(alloc::Condition<'static>);
@@ -43,21 +39,56 @@ mod global {
             }))
         }
 
-        /// Invalidates this [`Condition`] "immediately".
+        /// Invalidates this [`Condition`] "immediately". This has the same effect as dropping the
+        /// [`Condition`].
         ///
-        /// See [`alloc::Condition::invalidate_immediately`] for more details.
+        /// This may block the current thread. See [`alloc::Condition::invalidate_immediately`] for
+        /// more details.
         pub fn invalidate_immediately(self) {
             let inner = alloc::Condition::from(self);
             alloc::Global::with(|alloc| inner.invalidate_immediately(alloc));
         }
 
+        /// Invalidates this [`Condition`], and then calls the given function.
+        ///
+        /// This will never block the current thread. See [`alloc::Condition::invalidate_then`] for
+        /// more details.
+        pub fn invalidate_then(self, f: impl FnOnce() + Send + 'static) {
+            let inner = alloc::Condition::from(self);
+            alloc::Global::with(|alloc| inner.invalidate_then(alloc, f));
+        }
+
         /// Invalidates this [`Condition`] "eventually".
         ///
-        /// See [`alloc::Condition::invalidate_eventually`] for more details. For now, this is the type
-        /// of invalidation done when a [`Condition`] is dropped.
+        /// See [`alloc::Condition::invalidate_eventually`] for more details.
         pub fn invalidate_eventually(self) {
             let inner = alloc::Condition::from(self);
             alloc::Global::with(|alloc| inner.invalidate_eventually(alloc));
+        }
+
+        /// Sets this [`Condition`] to be invalidated "immediately" once `token` is no longer
+        /// valid.
+        ///
+        /// See [`alloc::Condition::invalidate_from_immediately`] for more details.
+        pub fn invalidate_from_immediately(self, token: Token) {
+            let inner = alloc::Condition::from(self);
+            let token = alloc::Token::from(token);
+            alloc::Global::with(|alloc| inner.invalidate_from_immediately(alloc, token));
+        }
+
+        /// Attempts to set this [`Condition`] to be invalidated "immediately" once `token` is no
+        /// longer valid.
+        ///
+        /// This can only fail if `token` is already invalid, in which case it will return the
+        /// condition unchanged. Unlike [`Condition::invalidate_from_immediately`], this will never
+        /// block the current thread.
+        ///
+        /// See [`alloc::Condition::try_invalidate_from`] for more details.
+        pub fn try_invalidate_from(self, token: Token) -> Result<(), Self> {
+            let inner = alloc::Condition::from(self);
+            let token = alloc::Token::from(token);
+            alloc::Global::with(|alloc| inner.try_invalidate_from(alloc, token))
+                .map_err(Condition::from)
         }
 
         /// Gets a [`Token`] which is valid for as long as this [`Condition`] is alive.
@@ -90,8 +121,12 @@ mod global {
 
     impl std::ops::Drop for Condition {
         fn drop(&mut self) {
-            let block = self.0.block;
-            alloc::Global::with(|alloc| alloc::Condition { block }.invalidate_eventually(alloc));
+            if !std::thread::panicking() {
+                let block = self.0.block;
+                alloc::Global::with(|alloc| {
+                    alloc::Condition { block }.invalidate_immediately(alloc)
+                });
+            }
         }
     }
 
@@ -139,6 +174,16 @@ mod global {
         /// Indicates whether this token will always be valid.
         pub fn is_always_valid(&self) -> bool {
             self.0.is_always_valid()
+        }
+
+        /// Ensures that `f()` is called once this token is invalidated.
+        ///
+        /// This will never block the current thread. If this token is already invalid, the call to
+        /// `f()` will happen immediately.  The call to `f()` will happen exactly once, and may 
+        /// occur on any thread. It should not block the calling thread.
+        pub fn on_invalid(self, f: impl FnOnce() + Send + 'static) {
+            let inner = alloc::Token::from(self);
+            alloc::Global::with(|alloc| inner.on_invalid(alloc, f));
         }
     }
 

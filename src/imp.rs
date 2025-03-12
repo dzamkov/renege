@@ -1,6 +1,6 @@
 use crate::alloc::Allocator;
 use crate::atomic::{Atomic, HasAtomic};
-use crate::atomic::{AtomicPtr, AtomicUsize, fence};
+use crate::atomic::{AtomicBool, AtomicPtr, AtomicUsize, fence};
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
@@ -61,23 +61,196 @@ impl<'alloc> Condition<'alloc> {
 
     /// Invalidates this [`Condition`] "immediately".
     ///
-    /// All calls to [`Token::is_valid`] on a token that was constructed from `self.token()` that
+    /// This call may block the current thread. If there are no requirements for when the
+    /// invalidation should become visible, use [`Condition::invalidate_eventually`] instead.
+    /// If blocking the current thread is not acceptable, use [`Condition::invalidate_then`]
+    /// instead.
+    ///
+    /// # Memory Ordering
+    ///
+    /// Let `x` be any [`Token`] that was constructed from `self.token()`.
+    ///
+    /// All calls to `x.is_valid()` that
+    /// [happen after](https://en.wikipedia.org/wiki/Happened-before)
+    /// this call are guaranteed to return `false`.
+    pub fn invalidate_immediately<Alloc: Allocator<'alloc> + ?Sized>(self, alloc: &mut Alloc) {
+        #[cfg(loom)]
+        use loom::cell::UnsafeCell;
+        #[cfg(loom)]
+        use loom::thread::{Thread, current, park};
+        #[cfg(not(loom))]
+        use std::cell::UnsafeCell;
+        #[cfg(not(loom))]
+        use std::thread::{Thread, current, park};
+
+        // Store information required to park/unpark the current thread. We can safely store this
+        // on the stack since we won't return from this function until the callback is called
+        let waiter = Waiter {
+            thread: UnsafeCell::new(Some(current())),
+            is_complete: AtomicBool::new(false),
+        };
+        let data = &waiter as *const _ as *mut ();
+        if unsafe { !self.invalidate_then_raw(alloc, on_complete, data) } {
+            while !waiter.is_complete.load(Relaxed) {
+                park()
+            }
+        }
+
+        /// Called when invalidation is complete.
+        unsafe fn on_complete(data: *mut ()) {
+            // SAFETY: `data` is a pointer to a `Waiter` which can't be dropped until after
+            // `is_complete` is set to `true`.
+            let waiter = unsafe { &*(data as *const Waiter) };
+            // SAFETY: `waiter.thread` can only be accessed inside of this function, and this
+            // function will be called at most once for a given `Waiter`, so `waiter.thread` should
+            // be non-`None` at this point.
+            #[cfg(not(loom))]
+            let thread = unsafe { (*waiter.thread.get()).take().unwrap_unchecked() };
+            #[cfg(loom)]
+            let thread = waiter
+                .thread
+                .with_mut(|thread| unsafe { &mut *thread }.take().unwrap());
+            waiter.is_complete.store(true, Relaxed);
+            thread.unpark(); // Synchronizes with unpark
+        }
+
+        /// Information about a thread which may be parked.
+        struct Waiter {
+            thread: UnsafeCell<Option<Thread>>,
+            is_complete: AtomicBool,
+        }
+    }
+
+    /// Begins invalidating this [`Condition`], ensuring that `f()` is called once invalidation
+    /// completes.
+    ///
+    /// This will never block the current thread.
+    ///
+    /// The call to `f()` will happen exactly once, and may occur on any thread that has access to
+    /// an [`Allocator`] for `'alloc`. It should not block the calling thread.
+    ///
+    /// # Memory Ordering
+    ///
+    /// Let `x` be any [`Token`] that was constructed from `self.token()`.
+    ///
+    /// All calls to `x.is_valid()` that occur inside or
+    /// [happen after](https://en.wikipedia.org/wiki/Happened-before) the call to `f()` are
+    /// guaranteed to return `false`.
+    pub fn invalidate_then<Alloc: Allocator<'alloc> + ?Sized>(
+        self,
+        alloc: &mut Alloc,
+        f: impl FnOnce() + Send + 'alloc,
+    ) {
+        let (g, data) = crate::util::into_fn_ptr(f);
+
+        // SAFETY: `g(data)` may be called on any thread at any time, assuming that `'alloc`
+        // is valid for the duration of the call.
+        unsafe {
+            if self.invalidate_then_raw(alloc, g, data) {
+                g(data)
+            }
+        }
+    }
+
+    /// Lower-level version of [`Condition::invalidate_then`].
+    ///
+    /// Begins invalidating this [`Condition`]. This will either return `true` to indicate that
+    /// invalidation has been completed immediately, or return `false`, in which case `f(data)`
+    /// will be called once invalidation completes.
+    ///
+    /// This will never block the current thread.
+    ///
+    /// If this returns `false`, the call to `f(data)` will happen exactly once, and may occur on
+    /// any thread that has access to an [`Allocator`] for `'alloc`. It should not block the
+    /// calling thread.
+    ///
+    /// # Memory Ordering
+    ///
+    /// Let `x` be any [`Token`] that was constructed from `self.token()`.
+    ///
+    /// If this returns `true`, all calls to `x.is_valid()` that
     /// [happen after](https://en.wikipedia.org/wiki/Happened-before) this call are guaranteed to
     /// return `false`.
     ///
-    /// This call may block the current thread and is generally slower than
-    /// [`Condition::invalidate_eventually`].
-    pub fn invalidate_immediately<Alloc: Allocator<'alloc> + ?Sized>(self, alloc: &mut Alloc) {
-        // TODO: Real implementation - block thread until invalidation propogation completes
+    /// If this returns `false`, all calls to `x.is_valid()` that occur inside or
+    /// [happen after](https://en.wikipedia.org/wiki/Happened-before) the call to `f(data)` are
+    /// guaranteed to return `false`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `f(data)` is safe to call on any thread at any time. It may
+    /// assume that `'alloc` is valid for the duration of the call, and that it is called at
+    /// most once.
+    pub unsafe fn invalidate_then_raw<Alloc: Allocator<'alloc> + ?Sized>(
+        self,
+        alloc: &mut Alloc,
+        f: unsafe fn(*mut ()),
+        data: *mut (),
+    ) -> bool {
+        // TODO: Real implementation
         self.invalidate_eventually(alloc);
+        true
     }
 
-    /// Invalidates this [`Condition`] "eventually".
+    /// Begins invalidating this [`Condition`].
     ///
-    /// This will never block the current thread.
+    /// This will never block the current thread, but offers no guarantees about when the effects
+    /// of the invalidation will be visible, even to the current thread. If stricter ordering
+    /// is required, use [`Condition::invalidate_immediately`] or [`Condition::invalidate_then`].
     pub fn invalidate_eventually<Alloc: Allocator<'alloc> + ?Sized>(self, alloc: &mut Alloc) {
         let block = self.block;
         invalidate_condition(alloc, block);
+    }
+
+    /// Sets this [`Condition`] to be invalidated "immediately" once `token` is no longer valid.
+    ///
+    /// If `token` has already been invalidated, this is equivalent to
+    /// [`Condition::invalidate_immediately`]. Note that this may block the current thread. If
+    /// this is not acceptable, use [`Condition::try_invalidate_from`] instead.
+    ///
+    /// Note that will cause a memory leak if `token` is [`Token::always`], since there would be
+    /// no way to invalidate the condition.
+    ///
+    /// # Memory Ordering
+    ///
+    /// Let `x` be any [`Token`] that was constructed from `self.token()`.
+    ///
+    /// All calls to `x.is_valid()` that
+    /// [happen after](https://en.wikipedia.org/wiki/Happened-before)
+    /// this call are guaranteed to return `false` if `token.is_valid()` would return `false`.
+    pub fn invalidate_from_immediately<Alloc: Allocator<'alloc> + ?Sized>(
+        self,
+        alloc: &mut Alloc,
+        token: Token<'alloc>,
+    ) {
+        if let Err(err) = self.try_invalidate_from(alloc, token) {
+            err.invalidate_immediately(alloc);
+        }
+    }
+
+    /// Attempts to set this [`Condition`] to be invalidated "immediately" once `token` is no
+    /// longer valid.
+    ///
+    /// This can only fail if `token` is already invalid, in which case it will return the
+    /// condition unchanged. Unlike [`Condition::invalidate_from_immediately`], this will never
+    /// block the current thread.
+    ///
+    /// Note that will cause a memory leak if `token` is [`Token::always`], since there would be
+    /// no way to invalidate the condition.
+    ///
+    /// # Memory Ordering
+    ///
+    /// Let `x` be any [`Token`] that was constructed from `self.token()`.
+    ///
+    /// If this call returns `Ok(())`, all calls to `x.is_valid()` that
+    /// [happen after](https://en.wikipedia.org/wiki/Happened-before)
+    /// this call are guaranteed to return `false` if `token.is_valid()` would return `false`.
+    pub fn try_invalidate_from<Alloc: Allocator<'alloc> + ?Sized>(
+        self,
+        alloc: &mut Alloc,
+        token: Token<'alloc>,
+    ) -> Result<(), Self> {
+        todo!()
     }
 
     /// Gets the [`ConditionId`] for this [`Condition`].
@@ -206,6 +379,50 @@ impl<'alloc> Token<'alloc> {
     /// Indicates whether this token will always be valid.
     pub fn is_always_valid(&self) -> bool {
         self == &Self::always()
+    }
+
+    /// Ensures that `f()` is called once this token is invalidated.
+    ///
+    /// This will never block the current thread. If this token is already invalid, the call to
+    /// `f()` will happen immediately.  The call to `f()` will happen exactly once, and may occur
+    /// on any thread that has access to an [`Allocator`] for `'alloc`. It should not block the
+    /// calling thread.
+    pub fn on_invalid<Alloc: Allocator<'alloc> + ?Sized>(
+        self,
+        alloc: &mut Alloc,
+        f: impl FnOnce() + Send + 'alloc,
+    ) {
+        let (g, data) = crate::util::into_fn_ptr(f);
+        // SAFETY: `g(data)` may be called on any thread at any time, assuming that `'alloc`
+        // is valid for the duration of the call.
+        unsafe {
+            if self.on_invalid_raw(alloc, g, data) {
+                g(data)
+            }
+        }
+    }
+
+    /// Lower-level version of [`Token::on_invalid`].
+    ///
+    /// Either returns `true` if this token is invalid, or returns `false` and ensures `f(data)`
+    /// will be called once this token is invalidated.
+    ///
+    /// This will never block the current thread. If this returns `false` the call to `f(data)`
+    /// will happen exactly once, and may occur on any thread that has access to an
+    /// [`Allocator`] for `'alloc`. It should not block the calling thread.
+    /// 
+    /// # Safety
+    ///
+    /// The caller must ensure that `f(data)` is safe to call on any thread at any time. It may
+    /// assume that `'alloc` is valid for the duration of the call, and that it is called at
+    /// most once.
+    pub unsafe fn on_invalid_raw<Alloc: Allocator<'alloc> + ?Sized>(
+        self,
+        alloc: &mut Alloc,
+        f: unsafe fn(*mut ()),
+        data: *mut (),
+    ) -> bool {
+        todo!()
     }
 }
 
@@ -1158,7 +1375,9 @@ struct BlockGuard<'alloc> {
 impl std::ops::Drop for BlockGuard<'_> {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
-        panic!("block was not unheld");
+        if !std::thread::panicking() {
+            panic!("block was not unheld");
+        }
     }
 }
 
