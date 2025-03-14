@@ -1,55 +1,75 @@
 //! This module contains helper types and functions for working with atomic values.
-#[cfg(not(loom))]
-pub use std::sync::atomic::{AtomicPtr, AtomicUsize, AtomicBool, fence};
+use crate::util::SafeTransmuteFrom;
 #[cfg(loom)]
-pub use loom::sync::atomic::{AtomicPtr, AtomicUsize, AtomicBool, fence};
+pub use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, fence};
 use std::sync::atomic::Ordering;
+#[cfg(not(loom))]
+pub use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, fence};
 
-/// A wrapper over a value of type `T` which permits interior mutability using atomic operations.
+/// A wrapper over an atomic type which can be loaded as a `Load` and stored as a `Store`.
+///
+/// `Load` and `Store` will usually be the same, but may differ when the same atomic location is
+/// used to store different types of values. In this case, `Load` will be the common supertype of
+/// all the `Store` types that can be stored in the atomic.
 #[repr(transparent)]
-pub struct Atomic<T: HasAtomic>(pub T::Atomic);
+pub struct Atomic<
+    Store: HasAtomic,
+    Load: HasAtomic<Prim = Store::Prim> + SafeTransmuteFrom<Store> = Store,
+>(
+    pub <Store::Prim as IsPrim>::Atomic,
+    std::marker::PhantomData<<Load::Prim as IsPrim>::Atomic>,
+);
 
 /// Indicates that the internal representation of a type matches some primitive which has an
 /// atomic counterpart.
-///
-/// # Safety
-/// The type must have the same size and alignment as `Prim`.
-pub unsafe trait HasAtomic: Copy {
+pub trait HasAtomic: Copy {
     /// The primitive representation of this type.
-    type Prim: HasAtomic<Prim = Self::Prim, Atomic = Self::Atomic>;
-
-    /// The atomic counterpart to `Prim`.
-    type Atomic: IsAtomic<Prim = Self::Prim>;
+    type Prim: IsPrim + SafeTransmuteFrom<Self>;
 
     /// Converts a value of this type into its primitive representation.
     fn into_prim(value: Self) -> Self::Prim {
-        unsafe { std::mem::transmute_copy(&value) }
+        SafeTransmuteFrom::transmute_from(value)
     }
 
     /// Gets a value of this type from its primitive representation.
+    ///
+    /// # Safety
+    /// The caller must ensure that `value` has a bit pattern which can soundly be interpreted as
+    /// having the type `Self`.
     unsafe fn from_prim(value: Self::Prim) -> Self {
+        // SAFETY: The caller must assure this is valid
         unsafe { std::mem::transmute_copy(&value) }
     }
 }
 
-unsafe impl HasAtomic for usize {
+impl HasAtomic for usize {
     type Prim = usize;
+}
+
+impl<T> HasAtomic for *mut T {
+    type Prim = *mut T;
+}
+
+impl<T> HasAtomic for Option<&'_ T> {
+    type Prim = *mut T;
+}
+
+/// A primitive type which has an atomic counterpart.
+pub trait IsPrim: Copy {
+    type Atomic: IsAtomic<Prim = Self>;
+}
+
+impl IsPrim for usize {
     type Atomic = AtomicUsize;
 }
 
-unsafe impl<T> HasAtomic for *mut T {
-    type Prim = *mut T;
-    type Atomic = AtomicPtr<T>;
-}
-
-unsafe impl<T> HasAtomic for Option<&'_ T> {
-    type Prim = *mut T;
+impl<T> IsPrim for *mut T {
     type Atomic = AtomicPtr<T>;
 }
 
 /// An atomic primitive type.
 pub trait IsAtomic {
-    type Prim: HasAtomic<Prim = Self::Prim, Atomic = Self>;
+    type Prim: IsPrim<Atomic = Self>;
     fn new(value: Self::Prim) -> Self;
     fn load(&self, order: Ordering) -> Self::Prim;
     fn store(&self, val: Self::Prim, order: Ordering);
@@ -134,64 +154,100 @@ impl<T> IsAtomic for AtomicPtr<T> {
 impl<T: HasAtomic> Atomic<T> {
     /// Constructs an [`Atomic`] wrapper over the given value.
     pub fn new(value: T) -> Self {
-        Self(T::Atomic::new(T::into_prim(value)))
+        Self(
+            <T::Prim as IsPrim>::Atomic::new(T::into_prim(value)),
+            std::marker::PhantomData,
+        )
     }
+}
 
+impl<Store: HasAtomic, Load: HasAtomic<Prim = Store::Prim> + SafeTransmuteFrom<Store>>
+    Atomic<Store, Load>
+{
     /// Loads a value from the [`Atomic`].
-    pub fn load(&self, order: Ordering) -> T {
+    pub fn load(&self, order: Ordering) -> Load {
         let prim = self.0.load(order);
-        unsafe { T::from_prim(prim) }
+        unsafe { Load::from_prim(prim) }
     }
 
     /// Stores a value into the [`Atomic`].
-    pub fn store(&self, val: T, order: Ordering) {
-        self.0.store(T::into_prim(val), order);
+    pub fn store(&self, val: Store, order: Ordering) {
+        self.0.store(Store::into_prim(val), order);
     }
 
     /// Stores a value into the [`Atomic`] if the current value is the same as `current`.
     pub fn compare_exchange(
         &self,
-        current: T,
-        new: T,
+        current: Load,
+        new: Store,
         success: Ordering,
         failure: Ordering,
-    ) -> Result<T, T> {
+    ) -> Result<Load, Load> {
         self.0
-            .compare_exchange(T::into_prim(current), T::into_prim(new), success, failure)
-            .map(|prim| unsafe { T::from_prim(prim) })
-            .map_err(|prim| unsafe { T::from_prim(prim) })
+            .compare_exchange(
+                Load::into_prim(current),
+                Store::into_prim(new),
+                success,
+                failure,
+            )
+            .map(|prim| unsafe { Load::from_prim(prim) })
+            .map_err(|prim| unsafe { Load::from_prim(prim) })
     }
 
     /// Stores a value into the [`Atomic`] if the current value is the same as `current`. May
     /// spuriously fail.
     pub fn compare_exchange_weak(
         &self,
-        current: T,
-        new: T,
+        current: Load,
+        new: Store,
         success: Ordering,
         failure: Ordering,
-    ) -> Result<T, T> {
+    ) -> Result<Load, Load> {
         self.0
-            .compare_exchange_weak(T::into_prim(current), T::into_prim(new), success, failure)
-            .map(|prim| unsafe { T::from_prim(prim) })
-            .map_err(|prim| unsafe { T::from_prim(prim) })
+            .compare_exchange_weak(
+                Load::into_prim(current),
+                Store::into_prim(new),
+                success,
+                failure,
+            )
+            .map(|prim| unsafe { Load::from_prim(prim) })
+            .map_err(|prim| unsafe { Load::from_prim(prim) })
+    }
+
+    /// Restricts the `Store` or loosens the `Load` type of an [`Atomic`] reference.
+    pub fn cast<NStore, NLoad>(&self) -> &Atomic<NStore, NLoad>
+    where
+        NStore: HasAtomic<Prim = Store::Prim>,
+        Store: SafeTransmuteFrom<NStore>,
+        NLoad: HasAtomic<Prim = Store::Prim> + SafeTransmuteFrom<NStore> + SafeTransmuteFrom<Load>,
+    {
+        // SAFETY: Both `Self` and `Atomic<NStore, NLoad>` have the same internal representation
+        // of `<Store::Prim as IsPrim>::Atomic`, so the question is whether loads and stores
+        // through the returned reference are safe. Since `Store: SafeTransmuteFrom<NStore>`,
+        // stores of type `NStore` are also valid stores of type `Store`. Similarly, since
+        // `NLoad: SafeTransmuteFrom<Load>`, loads of type `NLoad` are valid where a load
+        // of type `Load` would be valid.
+        unsafe { std::mem::transmute(self) }
     }
 }
 
 #[cfg(not(loom))]
-impl<T: HasAtomic<Prim = usize, Atomic = AtomicUsize>> Atomic<T> {
+impl<T: HasAtomic<Prim = usize>> Atomic<T> {
     /// Constructs an [`Atomic`] wrapper over the given primitive value.
-    /// 
+    ///
     /// Unlike [`Atomic::new`], this is `const`.
     pub const fn from_prim(value: usize) -> Self {
-        Self(AtomicUsize::new(value))
+        Self(AtomicUsize::new(value), std::marker::PhantomData)
     }
 }
 
 #[cfg(not(loom))]
-impl<Ptr: HasAtomic<Prim = *mut T, Atomic = AtomicPtr<T>>, T> Atomic<Ptr> {
+impl<Ptr: HasAtomic<Prim = *mut T>, T> Atomic<Ptr> {
     /// Constructs an [`Atomic`] wrapper over the null pointer.
     pub const fn null() -> Self {
-        Self(AtomicPtr::new(std::ptr::null_mut()))
+        Self(
+            AtomicPtr::new(std::ptr::null_mut()),
+            std::marker::PhantomData,
+        )
     }
 }

@@ -14,3 +14,22 @@ pub fn into_fn_ptr<F: FnOnce() -> T, T>(f: F) -> (unsafe fn(*mut ()) -> T, *mut 
     }
     (g::<F, T>, ptr)
 }
+
+// TODO: Reevaluate when/if https://github.com/rust-lang/rust/issues/99571 is stablized
+/// A type that can safely be transmuted from a value of type `T`.
+///
+/// # Safety
+/// This type may only be implemented if every possible value of `T` can soundly be reinterpreted
+/// as a `Self` with no additional assumptions. Consequently, `T` and `Self` must have the same
+/// size.
+pub unsafe trait SafeTransmuteFrom<T>: Sized {
+    /// Converts a value of type `T` into a value of this type.
+    fn transmute_from(value: T) -> Self {
+        // SAFETY: The implementor of this trait must assure this is valid
+        unsafe { std::mem::transmute_copy(&value) }
+    }
+}
+
+unsafe impl<T> SafeTransmuteFrom<T> for T {}
+
+unsafe impl<A, B> SafeTransmuteFrom<Option<&'_ A>> for *mut B {}

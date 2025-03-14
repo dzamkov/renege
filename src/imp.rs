@@ -1,6 +1,7 @@
 use crate::alloc::Allocator;
 use crate::atomic::{Atomic, HasAtomic};
-use crate::atomic::{AtomicBool, AtomicPtr, AtomicUsize, fence};
+use crate::atomic::{AtomicBool, fence};
+use crate::util::SafeTransmuteFrom;
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
@@ -410,7 +411,7 @@ impl<'alloc> Token<'alloc> {
     /// This will never block the current thread. If this returns `false` the call to `f(data)`
     /// will happen exactly once, and may occur on any thread that has access to an
     /// [`Allocator`] for `'alloc`. It should not block the calling thread.
-    /// 
+    ///
     /// # Safety
     ///
     /// The caller must ensure that `f(data)` is safe to call on any thread at any time. It may
@@ -561,10 +562,11 @@ struct BranchBlockFooter<'alloc> {
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
 struct BlockTag(usize);
 
-unsafe impl HasAtomic for BlockTag {
+impl HasAtomic for BlockTag {
     type Prim = usize;
-    type Atomic = AtomicUsize;
 }
+
+unsafe impl SafeTransmuteFrom<BlockTag> for usize {}
 
 impl BlockTag {
     /// A bit which indicates that a block is invalid.
@@ -617,10 +619,11 @@ struct SiblingBlockRef<'alloc> {
     _marker: std::marker::PhantomData<&'alloc Block<'alloc>>,
 }
 
-unsafe impl<'alloc> HasAtomic for SiblingBlockRef<'alloc> {
+impl<'alloc> HasAtomic for SiblingBlockRef<'alloc> {
     type Prim = *mut Block<'alloc>;
-    type Atomic = AtomicPtr<Block<'alloc>>;
 }
+
+unsafe impl<'alloc> SafeTransmuteFrom<SiblingBlockRef<'alloc>> for *mut Block<'alloc> {}
 
 impl<'alloc> SiblingBlockRef<'alloc> {
     /// A [`SiblingBlockRef`] corresponding to a value of [`None`].
@@ -781,10 +784,11 @@ impl ConditionId {
 #[derive(PartialEq, Eq, Clone, Copy)]
 struct ConditionRange(usize);
 
-unsafe impl HasAtomic for ConditionRange {
+impl HasAtomic for ConditionRange {
     type Prim = usize;
-    type Atomic = AtomicUsize;
 }
+
+unsafe impl SafeTransmuteFrom<ConditionRange> for usize {}
 
 impl ConditionRange {
     /// Constructs a [`ConditionRange`] which contains only the given [`ConditionId`].
