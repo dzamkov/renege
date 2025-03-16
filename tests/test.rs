@@ -1,4 +1,5 @@
 use renege::{Condition, Token};
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn test_3_cond() {
@@ -263,4 +264,47 @@ fn test_multithreaded_combine() {
             assert!(!token.is_valid());
         }
     });
+}
+
+#[test]
+fn test_multithreaded_callback() {
+    std::thread::scope(|s| {
+        let step = Arc::new(Mutex::new(0));
+        let step_guard = step.lock().unwrap();
+        let a = Condition::new();
+        let b = Condition::new();
+        let a_b_token = a.token() & b.token();
+        a_b_token.on_invalid({
+            let step = step.clone();
+            move || {
+                let mut step_guard = step.lock().unwrap();
+                assert_eq!(*step_guard, 0);
+                *step_guard = 1;
+                println!(
+                    "(A & B) invalidated from thread {:?}",
+                    std::thread::current().id()
+                );
+                drop(step_guard);
+            }
+        });
+        let j = s.spawn({
+            let step = step.clone();
+            move || {
+                a.invalidate_then(move || {
+                    let mut step_guard = step.lock().unwrap();
+                    assert_eq!(*step_guard, 1);
+                    *step_guard = 2;
+                    println!(
+                        "A invalidated from thread {:?}",
+                        std::thread::current().id()
+                    );
+                    drop(step_guard);
+                });
+            }
+        });
+        drop(step_guard);
+        let _ = j.join();
+        let step_guard = step.lock().unwrap();
+        assert_eq!(*step_guard, 2);
+    })
 }

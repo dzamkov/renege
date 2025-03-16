@@ -12,10 +12,10 @@ pub use crate::imp::{Block, Condition, ConditionId, Token};
 /// [`Allocator::free_block`] is called), so the backing storage can't shrink: it must be
 /// dropped all at once, along with all [`Token`]s and [`Condition`]s which use it.
 pub trait Allocator<'alloc> {
-    /// Allocates a new [`Block`].
+    /// Allocates a [`Block`].
     fn allocate_block(&mut self) -> &'alloc Block<'alloc>;
 
-    /// Frees a [`Block`].
+    /// Reclaims a [`Block`].
     ///
     /// This allows the block to be returned by a following call to [`Allocator::allocate_block`].
     fn free_block(&mut self, block: &'alloc Block<'alloc>);
@@ -112,6 +112,7 @@ mod global {
 
         /// Reclaims an unused [`Block`].
         fn free_block(&mut self, block: &'static Block<'static>) {
+            block.verify_clean();
             self.free_blocks.push(block);
         }
     }

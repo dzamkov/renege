@@ -2,6 +2,7 @@ use crate::alloc::Allocator;
 use crate::atomic::{Atomic, HasAtomic};
 use crate::atomic::{AtomicBool, fence};
 use crate::util::SafeTransmuteFrom;
+use std::cell::UnsafeCell;
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
@@ -26,37 +27,16 @@ impl<'alloc> Condition<'alloc> {
     /// order, so the age of a [`Condition`] can be approximated by its [`ConditionId`].
     pub fn new<Alloc: Allocator<'alloc> + ?Sized>(alloc: &mut Alloc, id: ConditionId) -> Self {
         let block = alloc.allocate_block();
+        block.verify_clean();
 
         // Relaxed memory order is sufficient here because the block won't be visible to
         // any other threads until the `Condition` is shared by the user, which would
         // require its own synchronization.
         block.range.store(ConditionRange::single(id), Relaxed);
-        debug_assert!(block.left_parent.load(Relaxed).is_none());
-        debug_assert!(block.right_parent.load(Relaxed).is_none());
-        debug_assert!(
-            block
-                .token_footer()
-                .first_left_child
-                .load(Relaxed)
-                .is_none()
-        );
-        debug_assert!(block.token_footer().right_tree.load(Relaxed).is_none());
-        debug_assert!(
-            block
-                .token_footer()
-                .next_left_sibling
-                .load(Relaxed)
-                .is_none()
-        );
-        debug_assert!(
-            block
-                .token_footer()
-                .prev_left_sibling
-                .load(Relaxed)
-                .is_none()
-        );
-        let tag = block.tag.load(Relaxed);
-        block.tag.store(tag.next(), Release);
+        let mut tag = block.tag.load(Relaxed);
+        debug_assert_eq!(tag.0 & !BlockTag::VERSION_MASK, 0);
+        tag.0 |= BlockTag::TOKEN_FLAG;
+        block.tag.store(tag, Relaxed);
         Self { block }
     }
 
@@ -76,11 +56,7 @@ impl<'alloc> Condition<'alloc> {
     /// this call are guaranteed to return `false`.
     pub fn invalidate_immediately<Alloc: Allocator<'alloc> + ?Sized>(self, alloc: &mut Alloc) {
         #[cfg(loom)]
-        use loom::cell::UnsafeCell;
-        #[cfg(loom)]
         use loom::thread::{Thread, current, park};
-        #[cfg(not(loom))]
-        use std::cell::UnsafeCell;
         #[cfg(not(loom))]
         use std::thread::{Thread, current, park};
 
@@ -105,12 +81,7 @@ impl<'alloc> Condition<'alloc> {
             // SAFETY: `waiter.thread` can only be accessed inside of this function, and this
             // function will be called at most once for a given `Waiter`, so `waiter.thread` should
             // be non-`None` at this point.
-            #[cfg(not(loom))]
             let thread = unsafe { (*waiter.thread.get()).take().unwrap_unchecked() };
-            #[cfg(loom)]
-            let thread = waiter
-                .thread
-                .with_mut(|thread| unsafe { &mut *thread }.take().unwrap());
             waiter.is_complete.store(true, Relaxed);
             thread.unpark(); // Synchronizes with unpark
         }
@@ -188,9 +159,19 @@ impl<'alloc> Condition<'alloc> {
         f: unsafe fn(*mut ()),
         data: *mut (),
     ) -> bool {
-        // TODO: Real implementation
-        self.invalidate_eventually(alloc);
-        true
+        let block = self.block;
+        let block = match invalidate_condition::<TokenBlockHolding<'alloc>>(block) {
+            Ok(block) => match finalize::<_, TokenBlockHolding<'alloc>>(alloc, block) {
+                Ok(_) => return true,
+                Err(block) => block,
+            },
+            Err(block) => block,
+        };
+
+        // SAFETY: The caller must ensure that calling `f(data)` is safe
+        unsafe { install_callback(alloc, &block, f, data) };
+        unhold_finalize(alloc, block);
+        false
     }
 
     /// Begins invalidating this [`Condition`].
@@ -200,7 +181,9 @@ impl<'alloc> Condition<'alloc> {
     /// is required, use [`Condition::invalidate_immediately`] or [`Condition::invalidate_then`].
     pub fn invalidate_eventually<Alloc: Allocator<'alloc> + ?Sized>(self, alloc: &mut Alloc) {
         let block = self.block;
-        invalidate_condition(alloc, block);
+        if let Ok(block) = invalidate_condition::<()>(block) {
+            let _ = finalize::<_, ()>(alloc, block);
+        }
     }
 
     /// Sets this [`Condition`] to be invalidated "immediately" once `token` is no longer valid.
@@ -314,14 +297,15 @@ impl<'alloc> Token<'alloc> {
 
     /// Implementation of [`Token::always`] given the [`ALWAYS_NEVER`] block.
     const fn always_inner(always_never: &'static Block<'static>) -> Self {
-        // SAFETY: All of the references inside of `ALWAYS_NEVER` will always be `None`, so
-        // it can safely be interpreted as having any `'alloc` lifetime.
+        // SAFETY: `ALWAYS_NEVER` will never be returned from `Allocator::allocate_block`,
+        // so it is permanently free. Thus, all of its internal references will always be `None`
+        // and it can be safely interpreted as having any `'alloc` lifetime.
         let block = unsafe {
             std::mem::transmute::<&'alloc Block<'static>, &'alloc Block<'alloc>>(always_never)
         };
         Self {
             block,
-            max_tag: BlockTag::new(1, true, 0),
+            max_tag: BlockTag::new(1, true).max_tag(),
         }
     }
 
@@ -345,14 +329,15 @@ impl<'alloc> Token<'alloc> {
 
     /// Implementation of [`Token::never`] given the [`ALWAYS_NEVER`] block.
     const fn never_inner(always_never: &'static Block<'static>) -> Self {
-        // SAFETY: All of the references inside of `ALWAYS_NEVER` will always be `None`, so
-        // it can safely be interpreted as having any `'alloc` lifetime.
+        // SAFETY: `ALWAYS_NEVER` will never be returned from `Allocator::allocate_block`,
+        // so it is permanently free. Thus, all of its internal references will always be `None`
+        // and it can be safely interpreted as having any `'alloc` lifetime.
         let block = unsafe {
             std::mem::transmute::<&'alloc Block<'static>, &'alloc Block<'alloc>>(always_never)
         };
         Self {
             block,
-            max_tag: BlockTag::new(0, true, 0),
+            max_tag: BlockTag::new(0, true).max_tag(),
         }
     }
 
@@ -423,7 +408,14 @@ impl<'alloc> Token<'alloc> {
         f: unsafe fn(*mut ()),
         data: *mut (),
     ) -> bool {
-        todo!()
+        if let Some(block) = hold(self) {
+            // SAFETY: The caller must ensure that calling `f(data)` is safe
+            unsafe { install_callback(alloc, &block, f, data) };
+            unhold_finalize(alloc, block);
+            false
+        } else {
+            true
+        }
     }
 }
 
@@ -455,109 +447,154 @@ impl std::fmt::Debug for Token<'_> {
 }
 
 /// The primitive unit of data storage for the library.
+///
+/// Blocks are reusable units of data which provide the backing storage for [`Condition`]s,
+/// [`Token`]s and several additional bookkeeping items.
 #[repr(C)]
 pub struct Block<'alloc> {
-    /// The tag for this block, consisting of the version number, invalid bit, and number of
-    /// "holders".
-    ///
-    /// It is guranteed that:
-    ///  * The version number will never decrease.
-    ///  * The invalid bit can't be cleared unless the version number increases.
-    ///  * The number of holders can't increase while the invalid bit is set.
-    ///  * If this is a [`Token`] block, the version number can't increase until all of this
-    ///    block's immediate children are invalidated.
-    ///
-    /// A block is "live" if either the invalid bit is cleared, or the number of holders is
-    /// greater than zero. Certain invariants must hold while the block is live, and this is key
-    /// to the lock-free design of the library. These invariants will be documented on the field
-    /// they apply to.
+    /// Provides information about the type and lifecycle of a block.
     tag: Atomic<BlockTag>,
 
-    /// Assuming that this is a [`Token`] block, this field describes the approximate range of
-    /// [`ConditionId`]s which the token may be sensitive to.
+    /// Assuming that this is a [`BlockType::Token`] block, this field describes the approximate
+    /// range of [`ConditionId`]s which the token may be sensitive to.
     ///
     /// This may not change while the block is live.
     range: Atomic<ConditionRange>,
 
-    /// Assuming that this is a [`Token`] block for a token created by combining two parent tokens,
-    /// this field points to the block for the "left" parent token.
+    /// The "protected" data for this [`Block`].
     ///
-    /// This may not change while the block is live. Regardless of whether the block is live, this
-    /// can never be updated to a dead block.
+    /// This may be accessed immutably when the block is held (see [`hold`]), and mutably while the
+    /// block is being finalized or initialized.
     ///
-    /// The `range` of the parent tokens must not overlap, with all [`ConditionId`]s in the `range`
-    /// of the left parent token being less than those in the `range` of the right parent token.
-    left_parent: Atomic<Option<&'alloc Block<'alloc>>>,
+    /// This is required because there is no portable way of storing a function pointer in
+    /// an [`Atomic`], as needed by `callback_fn`. To minimize [`Block`]s size, we store the
+    /// mutually-exclusive field `first_left_child` in the same union.
+    protected: UnsafeCell<Protected<'alloc>>,
 
-    /// Assuming that this is a [`Token`] block for a token created by combining two parent tokens,
-    /// this field points to the block for the "right" parent token.
+    /// The [`BlockType::Token`] block which is the "right" parent of this block. The right parent
+    /// of [`BlockType::Callback`] blocks is always [`None`].
     ///
-    /// This may not change while the block is live. Regardless of whether the block is live, this
-    /// can never be updated to a dead block.
+    /// This may not change while the block is live.
     ///
     /// The `range` of the parent tokens must not overlap, with all [`ConditionId`]s in the `range`
     /// of the left parent token being less than those in the `range` of the right parent token.
-    ///
-    /// If a block has a `right_parent`, but not a `left_parent`, then it is a "branch" block
-    /// for the "right search tree" of `right_parent`.
     right_parent: Atomic<Option<&'alloc Block<'alloc>>>,
 
-    /// The footer for this block, which contains type-specific data.
-    footer: BlockFooter<'alloc>,
+    /// The [`Beta`] data for this block.
+    beta: Beta<'alloc>,
 }
 
-/// The footer for a [`Block`].
+/// The "protected" data for a [`Block`].
+union Protected<'alloc> {
+    /// Assuming that this is a [`BlockType::Token`] block, this field stores a reference to the
+    /// first block in the doubly-linked list of token blocks which have this block as their
+    /// left parent.
+    pub first_left_child: ManuallyDrop<Atomic<Option<&'alloc Block<'alloc>>>>,
+
+    /// Assuming that this is a [`BlockType::Callback`] block, holds the function pointer for the
+    /// callback.
+    pub callback_fn: unsafe fn(*mut ()),
+}
+
+/// An arbitrary union of mutually-exclusive data with compatible representations, intended to save
+/// space in the [`Block`] struct.
 ///
-/// This contains different information depending on the block's type.
-union BlockFooter<'alloc> {
-    pub token: ManuallyDrop<TokenBlockFooter<'alloc>>,
-    pub branch: ManuallyDrop<BranchBlockFooter<'alloc>>,
+/// Fields within this group may be targeted by `compare_exchange` operations at any time, even
+/// after the block is freed.
+union Beta<'alloc> {
+    pub non_branch: ManuallyDrop<NonBranchBeta<'alloc>>,
+    pub branch: ManuallyDrop<BranchBeta<'alloc>>,
+
+    /// Assuming that this is a [`BlockType::Callback`] block, holds the data pointer for the
+    /// callback.
+    pub callback_data: ManuallyDrop<Atomic<*mut ()>>,
 }
 
-/// The footer for a [`Token`] block.
+/// The [`Beta`] data for a non-[`BlockType::Branch`] block.
 #[repr(C)]
-struct TokenBlockFooter<'alloc> {
-    /// A reference to the first [`Token`] block in the doubly-linked list of token blocks which
-    /// have this block as their left parent.
-    pub first_left_child: Atomic<Option<&'alloc Block<'alloc>>>,
-
-    /// A reference to the block at the root of the "right search tree" for this block.
+struct NonBranchBeta<'alloc> {
+    /// Assuming that this is a [`BlockType::Token`] block, holds a reference to the block at the
+    /// root of the "right search tree" for this block.
     ///
-    /// The right search tree contains all [`Token`] blocks which have this block as their
+    /// The right search tree contains all token blocks which have this block as their
     /// right parent. The tree is indexed by the address of the left parent of the token block.
     /// This allows efficiently searching for a token block which has a given left and right parent.
     ///
-    /// While the block is live, modifications to this field are restricted. It may only be changed
-    /// if any of the following are true:
+    /// While the block is live, modifications to this field are restricted. This may only
+    /// be updated if any of the following are true:
     ///  * `right_tree` is [`None`]
-    ///  * `right_tree` has its invalid bit set
-    ///  * `right_tree` has a `right_parent` which does not match this block
+    ///  * `right_tree` has a `right_parent` which is not this block
+    ///  * This block is being finalized by the current thread
     pub right_tree: Atomic<Option<&'alloc Block<'alloc>>>,
 
-    /// A reference to the next [`Token`] block in the doubly-linked list of token blocks which
+    /// The [`BlockType::Token`] block which is the "left" parent of this block.
+    ///
+    /// The `range` of the parent tokens must not overlap, with all [`ConditionId`]s in the `range`
+    /// of the left parent token being less than those in the `range` of the right parent token.
+    pub left_parent: Atomic<Option<&'alloc Block<'alloc>>>,
+
+    /// A reference to the next payload block in the doubly-linked list of token blocks which
     /// share the same left parent.
     pub next_left_sibling: Atomic<SiblingBlockRef<'alloc>>,
 
-    /// A reference to the previous [`Token`] block in the doubly-linked list of token blocks which
+    /// A reference to the previous payload block in the doubly-linked list of token blocks which
     /// share the same left parent.
     pub prev_left_sibling: Atomic<Option<&'alloc Block<'alloc>>>,
 }
 
-/// The footer for a "tree" block.
+/// The [`Beta`] data for a [`BlockType::Branch`] block.
 #[repr(C)]
-struct BranchBlockFooter<'alloc> {
-    /// The child nodes of tree block, organzied by the next few bits of their `left_parent`'s
+struct BranchBeta<'alloc> {
+    /// The child nodes of branch block, organzied by the next few bits of their `left_parent`'s
     /// address.
     ///
     /// While the block is live, modifications to this field are restricted. A child may only be
     /// changed if any of the following are true:
     ///  * The child is [`None`]
-    ///  * The child has its invalid bit set
     ///  * The child has a `right_parent` which does not match the root of the search tree
-    pub children: [Atomic<Option<&'alloc Block<'alloc>>>; TreeNode::BRANCH_SIZE],
+    ///  * The right parent of this block is being finalized by the current thread
+    pub children: [Atomic<Option<&'alloc Block<'alloc>>>; BRANCH_SIZE],
 }
 
-/// The "tag" for a [`Block`].
+/// Provides information about the type and lifecycle of a [`Block`].
+///
+/// The structure of the tag is as follows:
+/// ```text
+/// │ ...  20 │ 19 │ 18 │ 17 │ 16 │ 15 │ 14 │ 13 │ 12 │ 11 │ 10 │  9   ...   3 │  1 │  0 │
+/// ├───────────────────────────────────────┬────┬────┬────┬────┬────────────────────────┤
+/// │                VERSION                │ TK │  I │ HL │ HR │       NUM_HOLDERS      │
+/// └───────────────────────────────────────┴────┴────┴────┴────┴────────────────────────┘
+/// TK - TOKEN_FLAG
+/// I  - INVALID_FLAG
+/// HL - HOLDING_LEFT_FLAG
+/// HR - HOLDING_RIGHT_FLAG
+/// ```
+///
+/// # Invariants
+///
+/// For all blocks, the following rules apply:
+///  * `VERSION` may never decrease
+///  * Unless `TOKEN_FLAG` is set, `VERSION` is the only non-zero component of the tag
+///  * `TOKEN_FLAG` may not be cleared unless `VERSION` increases
+///  * `INVALID_FLAG` may not be cleared unless `VERSION` increases
+///
+/// [`BlockType::Branch`] and [`BlockType::Callback`] blocks don't make modifications to the tag:
+/// they just store a version number. However, once a block is allocated as a [`BlockType::Token`]
+/// block, its `TOKEN_FLAG` is set and the version number must be incremented before it can be
+/// freed.
+///
+/// For [`BlockType::Token`] blocks, the following rules apply:
+///  * `NUM_HOLDERS` provides the count of [`TokenBlockHolding`]s of the block.
+///  * Whenever the tag changes to a state where the `INVALID_FLAG` is set, and `NUM_HOLDERS`
+///    is zero, the thread that made the change obtains an exclusive [`TokenBlockFinalizing`] for
+///    the block (i.e. it becomes the "finalizing" thread and is responsible for [`finalize`]ing
+///    the block).
+///  * When the `INVALID_FLAG` is set, additional [`TokenBlockHolding`]s may not be created
+///    except through a [`TokenBlockFinalizing`].
+///  * If the `HOLD_LEFT_FLAG` is set, [`TokenBlockFinalizing`] implicitly comes with a
+///    [`TokenBlockHolding`] for the left parent.
+///  * If the `HOLD_RIGHT_FLAG` is set, [`TokenBlockFinalizing`] implicitly comes with a
+///    [`TokenBlockHolding`] for the right parent.
 #[repr(transparent)]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
 struct BlockTag(usize);
@@ -569,32 +606,39 @@ impl HasAtomic for BlockTag {
 unsafe impl SafeTransmuteFrom<BlockTag> for usize {}
 
 impl BlockTag {
-    /// A bit which indicates that a block is invalid.
-    pub const INVALID_BIT: usize = 1 << Self::HOLD_BITS;
+    /// A flag which indicates that a [`Block`] is a [`BlockType::Token`] block.
+    ///
+    /// There is no need to distinguish between [`BlockType::Branch`] and [`BlockType::Callback`]
+    /// blocks, because they are never used in the same context: branch blocks can only appear
+    /// in a right search tree, while callback blocks can only appear in a left child list.
+    pub const TOKEN_FLAG: usize = 1 << 13;
 
-    /// The number of bits used to store the number of "holder" threads this block has.
-    pub const HOLD_BITS: u32 = u8::BITS;
+    /// A flag which indicates that a [`BlockType::Token`] block is invalid.
+    pub const INVALID_FLAG: usize = 1 << 12;
 
-    /// A mask which selects the number of holders from the tag.
-    pub const HOLD_MASK: usize = (1 << Self::HOLD_BITS) - 1;
+    /// A flag which indicates that a [`BlockType::Token`] block is holding its left parent.
+    pub const HOLDING_LEFT_FLAG: usize = 1 << 11;
+
+    /// A flag which indicates that a [`BlockType::Token`] block is holding its right parent.
+    pub const HOLDING_RIGHT_FLAG: usize = 1 << 10;
+
+    /// The bit mask which selects `NUM_HOLDERS` from tha tag.
+    pub const NUM_HOLDERS_MASK: usize = (1 << 10) - 1;
 
     /// The shift applied to the version number in the tag.
-    pub const VERSION_SHIFT: u32 = Self::HOLD_BITS + 1;
+    pub const VERSION_SHIFT: u32 = 14;
 
-    /// A mask which selects the version number from the tag.
+    /// A bit mask which selects the version number from the tag.
     pub const VERSION_MASK: usize = usize::MAX << Self::VERSION_SHIFT;
 
     /// The maximum allowed version number for a block.
     pub const MAX_VERSION: usize = Self::VERSION_MASK >> Self::VERSION_SHIFT;
 
-    /// Constructs a [`BlockTag`] from its components.
-    pub const fn new(version: usize, invalid: bool, holders: u8) -> Self {
+    /// Constructs a [`BlockTag`] with the given version and token flag. All other bits are set to
+    /// zero.
+    pub const fn new(version: usize, is_token: bool) -> Self {
         assert!(version <= Self::MAX_VERSION);
-        Self(
-            (version << Self::VERSION_SHIFT)
-                | (invalid as usize * Self::INVALID_BIT)
-                | (holders as usize),
-        )
+        Self((version << Self::VERSION_SHIFT) | (is_token as usize * Self::TOKEN_FLAG))
     }
 
     /// Increments the version number of the tag and resets all other bits.
@@ -605,6 +649,61 @@ impl BlockTag {
                 .expect("block version number overflow"),
         )
     }
+
+    /// Gets the `max_tag` for the [`Token`] defined by a block with this tag.
+    pub const fn max_tag(self) -> Self {
+        Self((self.0 & Self::VERSION_MASK) | Self::TOKEN_FLAG | Self::INVALID_FLAG)
+    }
+
+    /// Indicates whether the `TOKEN_FLAG` is set.
+    pub const fn is_token(&self) -> bool {
+        self.0 & Self::TOKEN_FLAG != 0
+    }
+
+    /// Indicates whether the `INVALID_FLAG` is set.
+    pub const fn is_invalid(&self) -> bool {
+        self.0 & Self::INVALID_FLAG != 0
+    }
+
+    /// Indicates whether the `HOLDING_LEFT_FLAG` is set.
+    pub const fn is_holding_left(&self) -> bool {
+        self.0 & Self::HOLDING_LEFT_FLAG != 0
+    }
+
+    /// Indicates whether the `HOLDING_RIGHT_FLAG` is set.
+    pub const fn is_holding_right(&self) -> bool {
+        self.0 & Self::HOLDING_RIGHT_FLAG != 0
+    }
+
+    /// Gets the current number of [`TokenBlockHolding`]s for this block.
+    pub const fn num_holders(&self) -> usize {
+        self.0 & Self::NUM_HOLDERS_MASK
+    }
+}
+
+/// Identifies a possible type of [`Block`].
+///
+/// This struct exists for documentation purposes only.
+#[allow(dead_code)]
+enum BlockType {
+    /// A block which indexes a subset of right children for the [`BlockType::Token`] block
+    /// that is its `right_parent`.
+    ///
+    /// These blocks are "owned" by the corresponding token block, and their lifecycle is
+    /// inextricably linked to it. Thus, the only bits in [`BlockTag`] which are used are
+    /// the version number (which remains constant) and the type.
+    Branch,
+
+    /// A block which corresponds to a [`Token`].
+    ///
+    /// This is the only type of block which can have children. It keeps a list of its left
+    /// children and a search tree for its right children. Before completing finalization, it
+    /// must ensure that all of its children are finalized.
+    Token,
+
+    /// Similar to a [`BlockType::Token`] block, but instead of having children, it has a
+    /// callback function which must be called before completing finalization.
+    Callback,
 }
 
 /// A reference to a sibling block within a doubly-linked list of blocks.
@@ -645,11 +744,6 @@ impl<'alloc> SiblingBlockRef<'alloc> {
         }
     }
 
-    /// Indicates whether this is [`Self::NONE`].
-    pub const fn is_none(self) -> bool {
-        self.ptr.is_null()
-    }
-
     /// Gets the underlying `Option<&'alloc Block>` for this reference.
     pub fn source(self) -> Option<&'alloc Block<'alloc>> {
         unsafe { HasAtomic::from_prim(self.ptr.map_addr(|addr| addr & !Self::IS_REMOVING_BIT)) }
@@ -661,10 +755,10 @@ impl<'alloc> SiblingBlockRef<'alloc> {
     }
 }
 
-impl<'a> Atomic<SiblingBlockRef<'a>> {
+impl<'alloc> Atomic<SiblingBlockRef<'alloc>> {
     /// Sets the `is_removing` flag for this reference. Returns the underlying
     /// `Option<&'alloc Block>`.
-    pub fn mark_removing(&self, order: std::sync::atomic::Ordering) -> Option<&'a Block> {
+    pub fn mark_removing(&self, order: std::sync::atomic::Ordering) -> Option<&'alloc Block> {
         // TODO: Use `fetch_or` once it is stabilized
         // https://doc.rust-lang.org/std/sync/atomic/struct.AtomicPtr.html#method.fetch_or
         let mut cur = self.0.load(order);
@@ -691,12 +785,14 @@ impl<'alloc> Block<'alloc> {
     /// This can be used by an [`Allocator`] to create additional blocks.
     pub fn new() -> Self {
         Self {
-            tag: Atomic::new(BlockTag::new(0, true, 0)),
+            tag: Atomic::new(BlockTag::new(0, false)),
             range: Atomic::new(ConditionRange(0)),
-            left_parent: Atomic::new(None),
+            protected: UnsafeCell::new(Protected {
+                first_left_child: ManuallyDrop::new(Atomic::new(None)),
+            }),
             right_parent: Atomic::new(None),
-            footer: BlockFooter {
-                branch: ManuallyDrop::new(BranchBlockFooter {
+            beta: Beta {
+                branch: ManuallyDrop::new(BranchBeta {
                     children: [
                         Atomic::new(None),
                         Atomic::new(None),
@@ -708,35 +804,88 @@ impl<'alloc> Block<'alloc> {
         }
     }
 
-    /// Assuming this is a [`Token`] block, gets the footer for the block.
-    fn token_footer(&self) -> &TokenBlockFooter<'alloc> {
-        // SAFETY: All of the `footer` variants have the same field layout, so this is safe
-        // regardless of the actual type of the block.
-        unsafe { &self.footer.token }
-    }
-
-    /// Assuming this is a "branch" block, gets the footer for the block.
-    fn branch_footer(&self) -> &BranchBlockFooter<'alloc> {
-        // SAFETY: All of the `footer` variants have the same field layout, so this is safe
-        // regardless of the actual type of the block.
-        unsafe { &self.footer.branch }
-    }
-
     /// Assuming this is a [`Token`] block, gets the token it currently represents.
     ///
     /// This method must be used with caution, because it is very easy to unintentionally get
     /// the wrong token. Blocks may be invalidated, freed and reallocated as new tokens by another
-    /// thread at any time, unless the current thread actively prevents this from happening,
-    /// such as by holding a [`BlockGuard`].
+    /// thread at any time.
     fn token(&'alloc self) -> Token<'alloc> {
         Token {
             block: self,
-            max_tag: BlockTag(
-                (self.tag.load(Relaxed).0 & BlockTag::VERSION_MASK) | BlockTag::INVALID_BIT,
-            ),
+            max_tag: self.tag.load(Relaxed).max_tag(),
+        }
+    }
+
+    /// Gets the [`Protected::first_left_child`] field of this block.
+    ///
+    /// # Safety
+    /// The caller must ensure that this block is a [`BlockType::Token`] block for the duration
+    /// that the returned reference is used.
+    unsafe fn first_left_child(&self) -> &Atomic<Option<&'alloc Block<'alloc>>> {
+        // SAFETY: The caller is responsible for ensuring that this is safe
+        unsafe { &(*self.protected.get()).first_left_child }
+    }
+
+    /// Gets the [`Beta::callback_data`] field of this block.
+    fn callback_data(&self) -> &Atomic<*mut ()> {
+        // SAFETY: Regardless of what type of block this is, the `callback_data` field is always
+        // populated with a valid `Atomic<*mut ()>`.
+        unsafe { &*self.beta.callback_data }
+    }
+
+    /// Gets the [`NonBranchBeta::right_tree`] field of this block.
+    fn right_tree(&self) -> &Atomic<Option<&'alloc Block<'alloc>>, *mut Block<'alloc>> {
+        // SAFETY: Regardless of what type of block this is, the `right_tree` field is always
+        // populated with a valid `Atomic<*mut Block<'alloc>>`.
+        unsafe { self.beta.non_branch.right_tree.cast() }
+    }
+
+    /// Gets the [`NonBranchBeta::left_parent`] field of this block.
+    fn left_parent(&self) -> &Atomic<Option<&'alloc Block<'alloc>>> {
+        // SAFETY: Regardless of what type of block this is, the `left_parent` field is
+        // always occupied by a valid `Atomic<Option<&'alloc Block<'alloc>>>`.
+        unsafe { &self.beta.non_branch.left_parent }
+    }
+
+    /// Gets the [`NonBranchBeta::next_left_sibling`] field of this block.
+    fn next_left_sibling(&self) -> &Atomic<SiblingBlockRef<'alloc>> {
+        // SAFETY: Regardless of what type of block this is, the `next_left_sibling` field is
+        // always occupied by a valid `Atomic<SiblingBlockRef<'alloc>>`.
+        unsafe { &self.beta.non_branch.next_left_sibling }
+    }
+
+    /// Gets the [`NonBranchBeta::prev_left_sibling`] field of this block.
+    fn prev_left_sibling(&self) -> &Atomic<Option<&'alloc Block<'alloc>>> {
+        // SAFETY: Regardless of what type of block this is, the `prev_left_sibling` field is
+        // always occupied by a valid `Atomic<Option<&'alloc Block<'alloc>>>`.
+        unsafe { &self.beta.non_branch.prev_left_sibling }
+    }
+
+    /// Gets an entry into [`BranchBeta::children`] for this block.
+    fn child(&self, slot: usize) -> &Atomic<Option<&'alloc Block<'alloc>>, *mut Block<'alloc>> {
+        // SAFETY: Regardless of what type of block this is, all child slots are always occupied by
+        // a valid `Atomic<Option<&'alloc Block<'alloc>>, *mut Block<'alloc>>`
+        unsafe { self.beta.branch.children[slot].cast() }
+    }
+
+    /// In debug builds, verifies that a block is in a "clean" state, as should be the case when
+    /// obtained from or returned to an [`Allocator`].
+    pub(crate) fn verify_clean(&self) {
+        debug_assert_eq!(self.tag.load(Relaxed).0 & !BlockTag::VERSION_MASK, 0);
+        debug_assert_eq!(
+            unsafe { self.first_left_child().0.load(Relaxed) },
+            std::ptr::null_mut()
+        );
+        debug_assert_eq!(self.right_parent.0.load(Relaxed), std::ptr::null_mut());
+        for i in 0..BRANCH_SIZE {
+            debug_assert_eq!(self.child(i).0.load(Relaxed), std::ptr::null_mut());
         }
     }
 }
+
+// SAFETY: The only field which is potentially not `Sync` is the `protected` field, which can only
+// accessed in the module. All of these accesses have their own safety documentation.
+unsafe impl Sync for Block<'_> {}
 
 impl Default for Block<'_> {
     fn default() -> Self {
@@ -749,6 +898,49 @@ impl std::fmt::Debug for Block<'_> {
         // `Block` is opaque to the user, so we don't have to expose any of its fields.
         f.debug_struct("Block").finish_non_exhaustive()
     }
+}
+
+/// A special [`Block`] used to implement the "always" and "never" tokens.
+#[cfg(not(loom))]
+static ALWAYS_NEVER: Block<'static> = Block {
+    tag: Atomic::from_prim(BlockTag::new(1, true).0),
+    // Use a high range so that this block will always be the "right parent" of a combined
+    // token. The right parent is checked for validity before the left parent.
+    range: Atomic::from_prim(ConditionRange::single(ConditionId::MAX).0),
+    protected: UnsafeCell::new(Protected {
+        first_left_child: ManuallyDrop::new(Atomic::null()),
+    }),
+    right_parent: Atomic::null(),
+    beta: Beta {
+        non_branch: std::mem::ManuallyDrop::new(NonBranchBeta {
+            right_tree: Atomic::null(),
+            left_parent: Atomic::null(),
+            next_left_sibling: Atomic::null(),
+            prev_left_sibling: Atomic::null(),
+        }),
+    },
+};
+
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref ALWAYS_NEVER: Block<'static> = Block {
+        tag: Atomic::new(BlockTag::new(1, true)),
+        // Use a high range so that this block will always be the "right parent" of a combined
+        // token. The right parent is checked for validity before the left parent.
+        range: Atomic::new(ConditionRange::single(ConditionId::MAX)),
+        protected: UnsafeCell::new(Protected {
+            first_left_child: ManuallyDrop::new(Atomic::new(None)),
+        }),
+        right_parent: Atomic::new(None),
+        beta: Beta {
+            non_branch: std::mem::ManuallyDrop::new(NonBranchBeta {
+                right_tree: Atomic::new(None),
+                left_parent: Atomic::new(None),
+                next_left_sibling: Atomic::new(SiblingBlockRef::NONE),
+                prev_left_sibling: Atomic::new(None),
+            }),
+        },
+    };
 }
 
 /// A unique identifier for a [`Condition`] within a certain context.
@@ -904,45 +1096,6 @@ enum ConditionRangeRelation {
     Equal,
 }
 
-/// A special [`Block`] used to implement the "always" and "never" tokens.
-#[cfg(not(loom))]
-static ALWAYS_NEVER: Block<'static> = Block {
-    tag: Atomic::from_prim(BlockTag::new(1, false, 0).0),
-    // Use a high range so that this block will always be the "right parent" of a combined
-    // token. The right parent is checked for validity before the left parent.
-    range: Atomic::from_prim(ConditionRange::single(ConditionId::MAX).0),
-    left_parent: Atomic::null(),
-    right_parent: Atomic::null(),
-    footer: BlockFooter {
-        token: std::mem::ManuallyDrop::new(TokenBlockFooter {
-            first_left_child: Atomic::null(),
-            right_tree: Atomic::null(),
-            next_left_sibling: Atomic::null(),
-            prev_left_sibling: Atomic::null(),
-        }),
-    },
-};
-
-#[cfg(loom)]
-loom::lazy_static! {
-    static ref ALWAYS_NEVER: Block<'static> = Block {
-        tag: Atomic::new(BlockTag::new(1, false, 0)),
-        // Use a high range so that this block will always be the "right parent" of a combined
-        // token. The right parent is checked for validity before the left parent.
-        range: Atomic::new(ConditionRange::single(ConditionId::MAX)),
-        left_parent: Atomic::new(None),
-        right_parent: Atomic::new(None),
-        footer: BlockFooter {
-            token: std::mem::ManuallyDrop::new(TokenBlockFooter {
-                first_left_child: Atomic::new(None),
-                right_tree: Atomic::new(None),
-                next_left_sibling: Atomic::new(SiblingBlockRef::NONE),
-                prev_left_sibling: Atomic::new(None),
-            }),
-        },
-    };
-}
-
 impl<'alloc> Token<'alloc> {
     /// Gets the left and right parents of a token, or returns [`None`] if the token is invalid or
     /// doesn't have parents.
@@ -950,7 +1103,7 @@ impl<'alloc> Token<'alloc> {
     /// If this returns [`Some`], then it is guranteed that, whenever this token is invalid, at
     /// least one of the returned parents is invalid.
     fn parents(&self) -> Option<(Token<'alloc>, Token<'alloc>)> {
-        let left = self.block.left_parent.load(Relaxed)?.token();
+        let left = self.block.left_parent().load(Relaxed)?.token();
         let right = self.block.right_parent.load(Relaxed)?.token();
         fence(Acquire); // Synchronizes with token invalidation
         if self.is_valid() {
@@ -994,7 +1147,7 @@ impl<'alloc> Token<'alloc> {
         a: Token<'alloc>,
         b: Token<'alloc>,
     ) -> Token<'alloc> {
-        // These ranges may be incorrect if the associated tokens have been invalidated, but that
+        // These ranges may be incorrect if the associated tokens have been freed, but that
         // doesn't matter because in every branch, we will eventually check if the tokens are valid
         // and return `Token::never()` if not.
         let a_range = a.block.range.load(Relaxed);
@@ -1085,279 +1238,288 @@ impl<'alloc> Token<'alloc> {
         range: ConditionRange,
     ) -> Token<'alloc> {
         // Perform a preliminary search for the desired token.
-        let node = match TreeNode::root(right.block).search(left.block, right.block) {
-            Ok(token) => {
-                // The search gave us a token which has the correct parent *blocks*, but we still
-                // need to make sure it has the correct parent *tokens*. We do this by checking that
-                // the parent tokens are still valid. Otherwise, it could be possible that either
-                // `left.block` or `right.block` was invalidated and reallocated as a new token, in
-                // which case the returned token would erroneously be considered valid.
-                fence(Acquire); // Synchronizes with token invalidation
-                return if right.is_valid() && left.is_valid() {
+        let slot = match search_right_child(left.block, right) {
+            Some(Ok(token)) => {
+                // The search gave us a token which has the correct right parent token, and the
+                // correct left parent *block*, but we still need to make sure it has the
+                // correct left parent *token*. We can do this by simply checking that the
+                // left parent token is still valid. Otherwise, it could be possible that
+                // `left.block` was invalidated and reallocated as a new token, in which case
+                // the returned token would erroneously be considered valid.
+                return if left.is_valid() {
                     token
                 } else {
                     Token::never()
                 };
             }
-            Err(node) => node,
+            Some(Err(slot)) => slot,
+            None => return Token::never(),
         };
 
         // Hold the parent blocks to keep them alive while we create the new token. This also
         // gives us one final check that the parent tokens are valid before we proceed.
-        let Some(right_guard) = hold(right) else {
+        let Some(right) = hold(right) else {
             return Token::never();
         };
-        let Some(left_guard) = hold(left) else {
-            unhold(alloc, right_guard);
+        let Some(left) = hold(left) else {
+            unhold_finalize(alloc, right);
             return Token::never();
         };
 
         // Create new block for the token.
         let block = alloc.allocate_block();
+        block.verify_clean();
         block.range.store(range, Relaxed);
-        block.left_parent.store(Some(left.block), Relaxed);
+        block.left_parent().store(Some(left.block), Relaxed);
         block.right_parent.store(Some(right.block), Relaxed);
-        debug_assert!(
-            block
-                .token_footer()
-                .first_left_child
-                .load(Relaxed)
-                .is_none()
-        );
-        debug_assert!(block.token_footer().right_tree.load(Relaxed).is_none());
-        debug_assert!(
-            block
-                .token_footer()
-                .next_left_sibling
-                .load(Relaxed)
-                .is_none()
-        );
-        debug_assert!(
-            block
-                .token_footer()
-                .prev_left_sibling
-                .load(Relaxed)
-                .is_none()
-        );
-        fence(Release); // Synchronizes with token creation
-        let tag = block.tag.load(Relaxed).next();
-        block.tag.store(tag, Release);
+        let tag = block.tag.load(Relaxed);
+        debug_assert_eq!(tag.0 & !BlockTag::VERSION_MASK, 0);
+        let mut n_tag = tag;
+        n_tag.0 |= BlockTag::TOKEN_FLAG;
+        block.tag.store(n_tag, Relaxed);
 
         // Try to insert the new token into the tree
-        if let Err(token) = node.insert(alloc, left.block, &right_guard, block) {
+        if let Err(token) = unsafe { insert_right_child(alloc, left.block, &right, slot, block) } {
             // Another thread created the token before us. Clean up and return the existing token.
-            block
-                .tag
-                .store(BlockTag(tag.0 | BlockTag::INVALID_BIT), Relaxed);
-            block.left_parent.store(None, Relaxed);
+            block.tag.store(tag, Relaxed);
+            block.left_parent().store(None, Relaxed);
             block.right_parent.store(None, Relaxed);
             alloc.free_block(block);
-            unhold(alloc, left_guard);
-            unhold(alloc, right_guard);
+            unhold_finalize(alloc, left);
+            unhold_finalize(alloc, right);
             return token;
         }
 
         // Insert the new token into the left parent's list of children.
-        insert_left_child(alloc, &left_guard, block);
+        insert_left_child(alloc, &left, block);
 
         // Clean up and return the new token
-        unhold(alloc, left_guard);
-        unhold(alloc, right_guard);
+        unhold_finalize(alloc, left);
+        unhold_finalize(alloc, right);
         Token {
             block,
-            max_tag: BlockTag(tag.0 | BlockTag::INVALID_BIT),
+            max_tag: tag.max_tag(),
         }
     }
 }
 
-/// Represents a node of a "right search tree".
-struct TreeNode<'alloc> {
-    /// The current contents of this node.
-    ///
-    /// Rather than directly referencing the block, this references the [`Atomic`] which defines
-    /// the conents for this node, allowing the node to be updated.
-    slot: &'alloc Atomic<Option<&'alloc Block<'alloc>>>,
+/// The number of bits that are addressed by each branch node in a "right search tree".
+const BRANCH_BITS: u32 = 2;
 
-    /// The index of the first bit of the `left_parent` address that is considered by this node.
+/// The number of slots in a branch node.
+const BRANCH_SIZE: usize = 1 << BRANCH_BITS;
+
+/// The number of least-significant bits of the left parent address that are ignored when
+/// searching for a token in a "right search tree".
+const SKIP_BITS: u32 = std::mem::size_of::<Block>().ilog2();
+
+/// Searches the "right search tree" of `right_parent` for a child [`Token`] with the given
+/// left parent.
+///
+/// Returns `Some(Ok(token))` if a token was found. In which case, it is guaranteed that
+/// at least one of the following is true:
+///  * The returned token is the only valid token with the given `left_parent` and `right_parent`.
+///  * `left_parent` was invalid at some point during this call.
+///  * Both the returned token and `right_parent` are invalid.
+///
+/// Returns `Some(Err(slot))` if no such token was found. In which case, returns the [`TreeSlot`]
+/// where the token should be inserted.
+///
+/// Returns `None` if `right_parent` is known to be invalid.
+fn search_right_child<'alloc>(
+    left_parent: &'alloc Block<'alloc>,
+    right_parent: Token<'alloc>,
+) -> Option<Result<Token<'alloc>, TreeSlot<'alloc>>> {
+    let mut bit_depth = SKIP_BITS;
+    let mut slot = right_parent.block.right_tree();
+    loop {
+        let block = slot.load(Acquire); // Synchronizes with block publication
+        if block.is_null() {
+            return Some(Err(TreeSlot {
+                ptr: slot,
+                bit_depth,
+            }));
+        }
+        if !right_parent.is_valid() {
+            return None;
+        }
+
+        // SAFETY: Once a slot is present in a search tree, it will continue to be a valid slot
+        // until its owner (`right_parent`) is finalized. We checked that `right_parent` was
+        // valid after reading the contents of the slot, so `block` must be a valid reference
+        // to a block.
+        let block: &'alloc Block<'alloc> = unsafe { &*block };
+
+        // Get the tag for the block before checking `block.right_parent` so we know that we
+        // got the correct tag.
+        let tag = block.tag.load(Acquire); // Synchronizes with version increment
+
+        // Check whether the block actually belongs to this tree. It's possible for an old
+        // member of the tree to be freed and reallocated as a new unrelated block.
+        if !std::ptr::eq(
+            HasAtomic::into_prim(block.right_parent.load(Relaxed)),
+            right_parent.block,
+        ) {
+            return Some(Err(TreeSlot {
+                ptr: slot,
+                bit_depth,
+            }));
+        }
+
+        // Check whether this is a branch block
+        if !tag.is_token() {
+            slot = block.child((left_parent as *const Block as usize >> bit_depth) % BRANCH_SIZE);
+            bit_depth += BRANCH_BITS;
+            continue;
+        };
+
+        // Check whether this is the token block we are looking for.
+        let block_left_parent = block.left_parent().load(Relaxed);
+        let token = Token {
+            block,
+            max_tag: tag.max_tag(),
+        };
+        if std::ptr::eq(HasAtomic::into_prim(block_left_parent), left_parent) && token.is_valid() {
+            return Some(Ok(token));
+        } else {
+            return Some(Err(TreeSlot {
+                ptr: slot,
+                bit_depth,
+            }));
+        }
+    }
+}
+
+/// Identifies a "slot" in a "right search tree" where a [`BlockType::Token`] block could be
+/// inserted.
+struct TreeSlot<'alloc> {
+    /// The [`Atomic`] which determines the contents of this slot.
+    ///
+    /// If `owner` is valid, all slots within the tree must point to a valid block.
+    ptr: &'alloc Atomic<Option<&'alloc Block<'alloc>>, *mut Block<'alloc>>,
+
+    /// The index of the first bit of the `left_parent` address that is addressed by the
+    /// subtree
     bit_depth: u32,
 }
 
-impl<'alloc> TreeNode<'alloc> {
-    /// The number of bits that are addressed by each branch node in a "right search tree".
-    const BRANCH_BITS: u32 = 2;
+/// Attempts to insert a [`Token`] block into the tree rooted at this node. `right_parent` must
+/// be the owner of the tree. If there is already a token with the given `left_parent` and
+/// `right_parent`, this will return the existing token.
+///
+/// # Safety
+/// The caller must ensure that `right_parent` is the owner of tree containing `slot`. Just don't
+/// mix [`TreeSlot`]s from different trees - easy!
+unsafe fn insert_right_child<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
+    alloc: &mut Alloc,
+    left_parent: &'alloc Block<'alloc>,
+    right_parent: &TokenBlockHolding<'alloc>,
+    slot: TreeSlot<'alloc>,
+    target: &'alloc Block<'alloc>,
+) -> Result<(), Token<'alloc>> {
+    let mut occupant = std::ptr::null_mut();
+    let mut bit_depth = slot.bit_depth;
+    let mut slot = slot.ptr;
+    'replace: loop {
+        // We have already decided that we can remove `occupant`, so we will try to replace it
+        // with `target` now.
+        let Err(n_occupant) = slot.compare_exchange_weak(occupant, Some(target), Release, Acquire)
+        else {
+            return Ok(());
+        };
+        occupant = n_occupant;
+        'occupied: loop {
+            if occupant.is_null() {
+                continue 'replace;
+            }
 
-    /// The number of slots in a branch node.
-    const BRANCH_SIZE: usize = 1 << Self::BRANCH_BITS;
+            // SAFETY: Once a slot is present in a search tree, it will continue to be a valid slot
+            // until its owner (`right_parent`) is finalized. We are holding `right_parent`, so
+            // it can't be finalized during this call. Thus, every value read from a slot must
+            // be a valid reference to a block.
+            let block: &'alloc Block<'alloc> = unsafe { &*occupant };
 
-    /// The number of least-significant bits of the left parent address that are ignored when
-    /// searching for a token in a "right search tree".
-    const SKIP_BITS: u32 = std::mem::size_of::<Block>().ilog2();
-
-    /// Gets the root [`TreeNode`] for the right search tree of the given block.
-    pub fn root(right_parent: &'alloc Block<'alloc>) -> Self {
-        let right_tree = &right_parent.token_footer().right_tree;
-        Self {
-            slot: right_tree,
-            bit_depth: Self::SKIP_BITS,
-        }
-    }
-
-    /// Searches the tree rooted at this node for a [`Token`] with the given left parent.
-    /// `right_parent` must be the owner of the tree. If the requested token is not found, this
-    /// returns the [`TreeNode`] where it should be inserted.
-    ///
-    /// If a token is returned, it is guaranteed that one of the following is true:
-    ///  * The returned token is the only valid token with the given `left_parent` and
-    ///    `right_parent`.
-    ///  * Either `left_parent` or `right_parent` were invalid at some point during this call.
-    pub fn search(
-        mut self,
-        left_parent: &'alloc Block<'alloc>,
-        right_parent: &'alloc Block<'alloc>,
-    ) -> Result<Token<'alloc>, TreeNode<'alloc>> {
-        loop {
-            // Check if a block is in the slot.
-            let Some(block) = self.slot.load(Acquire) else {
-                return Err(self);
-            };
-
-            // Assuming that this block is a token block (which might not be the case), grab a
-            // `Token` for it now so that we can verify if it was invalidated later.
-            let token = block.token();
-            fence(Acquire); // Synchronizes with token creation
+            // Get the tag for the block before checking `block.right_parent` so we know that we
+            // got the correct tag.
+            let tag = block.tag.load(Acquire); // Synchronizes with version increment
 
             // Check whether the block actually belongs to this tree. It's possible for an old
             // member of the tree to be freed and reallocated as a new unrelated block.
-            if !std::ptr::eq(block.right_parent.0.load(Relaxed), right_parent) {
-                return Err(self);
+            if !std::ptr::eq(
+                HasAtomic::into_prim(block.right_parent.load(Relaxed)),
+                right_parent.block,
+            ) {
+                continue 'replace;
             }
 
             // Check whether this is a branch block
-            let block_left_parent = block.left_parent.load(Relaxed);
-            let Some(block_left_parent) = block_left_parent else {
-                self.slot = &block.branch_footer().children
-                    [(left_parent as *const Block as usize >> self.bit_depth) % Self::BRANCH_SIZE];
-                self.bit_depth += Self::BRANCH_BITS;
-                continue;
+            if !tag.is_token() {
+                let target_bits = (left_parent as *const Block as usize) >> bit_depth;
+                let target_slot_index = target_bits % BRANCH_SIZE;
+                slot = block.child(target_slot_index);
+                bit_depth += BRANCH_BITS;
+                occupant = std::ptr::null_mut();
+                continue 'replace;
             };
 
             // Check whether this is the token block we are looking for.
-            fence(Acquire); // Synchronizes with token invalidation
-            if token.is_valid() && std::ptr::eq(block_left_parent, left_parent) {
-                return Ok(token);
-            } else {
-                return Err(self);
-            }
-        }
-    }
-
-    /// Attempts to insert a [`Token`] block into the tree rooted at this node. `right_parent` must
-    /// be the owner of the tree. If there is already a token with the given `left_parent` and
-    /// `right_parent`, this will return the existing token.
-    pub fn insert<Alloc: Allocator<'alloc> + ?Sized>(
-        mut self,
-        alloc: &mut Alloc,
-        left_parent: &'alloc Block<'alloc>,
-        right_guard: &BlockGuard<'alloc>,
-        target: &'alloc Block<'alloc>,
-    ) -> Result<(), Token<'alloc>> {
-        let right_parent = right_guard.block;
-        let mut occupant = None;
-        'replace: loop {
-            // We have already decided that we can remove `occupant`, so we will try to replace it
-            // with `target` now.
-            let Err(n_occupant) =
-                self.slot
-                    .compare_exchange_weak(occupant, Some(target), Release, Acquire)
-            else {
-                return Ok(());
+            let block_left_parent = block.left_parent().load(Relaxed);
+            let token = Token {
+                block,
+                max_tag: tag.max_tag(),
             };
-            occupant = n_occupant;
-            'occupied: loop {
-                let Some(block) = occupant else {
-                    continue 'replace;
-                };
+            if !token.is_valid() {
+                continue 'replace;
+            }
+            if std::ptr::eq(HasAtomic::into_prim(block_left_parent), left_parent) {
+                return Err(token);
+            }
 
-                // Assuming that this block is a token block (which might not be the case), grab a
-                // `Token` for it now so that we can verify if it was invalidated later.
-                let token = block.token();
-                fence(Acquire); // Synchronizes with token creation
+            // SAFETY: At this point, we know `block` is a valid token block with a right
+            // parent. All such blocks must also have a left parent.
+            let block_left_parent = unsafe { block_left_parent.unwrap_unchecked() };
 
-                // Check whether the block actually belongs to this tree. It's possible for an old
-                // member of the tree to be freed and reallocated as a new unrelated block.
-                if !std::ptr::eq(block.right_parent.0.load(Relaxed), right_parent) {
-                    continue 'replace;
-                }
+            // There is a valid token block in the slot, but it's not the one we're looking
+            // for. We will have to create a branch block here so we can fit the existing
+            // token, and the new token.
+            loop {
+                let block_bits = (block_left_parent as *const Block as usize) >> bit_depth;
+                let target_bits = (left_parent as *const Block as usize) >> bit_depth;
+                debug_assert_ne!(block_bits, target_bits);
+                let block_slot_index = block_bits % BRANCH_SIZE;
+                let target_slot_index = target_bits % BRANCH_SIZE;
+                let branch = alloc.allocate_block();
+                branch.verify_clean();
+                branch.right_parent.store(Some(right_parent.block), Relaxed);
+                branch.child(target_slot_index).store(Some(target), Relaxed);
+                branch.child(block_slot_index).store(Some(block), Relaxed);
 
-                // Check whether this is a branch block
-                let block_left_parent = block.left_parent.load(Relaxed);
-                let Some(block_left_parent) = block_left_parent else {
-                    self.slot = &block.branch_footer().children[(left_parent as *const Block
-                        as usize
-                        >> self.bit_depth)
-                        % Self::BRANCH_SIZE];
-                    self.bit_depth += Self::BRANCH_BITS;
-                    occupant = None;
-                    continue 'replace;
-                };
+                // Attempt to insert branch
+                match slot.compare_exchange(occupant, Some(branch), Release, Acquire) {
+                    Ok(_) => {
+                        // Check if we're done
+                        if block_slot_index != target_slot_index {
+                            return Ok(());
+                        }
 
-                // Check whether this is the token block we are looking for.
-                fence(Acquire); // Synchronizes with token invalidation
-                if !token.is_valid() {
-                    continue 'replace;
-                }
-                if std::ptr::eq(block_left_parent, left_parent) {
-                    return Err(token);
-                }
-
-                // There is a valid token block in the slot, but it's not the one we're looking
-                // for. We will have to create a branch block here so we can fit the existing
-                // token, and the new token.
-                loop {
-                    let block_bits = (block_left_parent as *const Block as usize) >> self.bit_depth;
-                    let target_bits = (left_parent as *const Block as usize) >> self.bit_depth;
-                    debug_assert_ne!(block_bits, target_bits);
-                    let block_slot_index = block_bits % Self::BRANCH_SIZE;
-                    let target_slot_index = target_bits % Self::BRANCH_SIZE;
-                    let branch = alloc.allocate_block();
-                    debug_assert!(branch.left_parent.load(Relaxed).is_none());
-                    branch.right_parent.store(Some(right_parent), Relaxed);
-                    for child in branch.branch_footer().children.iter() {
-                        debug_assert!(child.load(Relaxed).is_none());
+                        // We need to create more branches to distinguish between the two
+                        // blocks.
+                        slot = branch.child(block_slot_index);
+                        bit_depth += BRANCH_BITS;
+                        occupant = std::ptr::null_mut();
+                        continue;
                     }
-                    branch.branch_footer().children[target_slot_index].store(Some(target), Relaxed);
-                    branch.branch_footer().children[block_slot_index].store(Some(block), Relaxed);
-
-                    // Attempt to insert branch
-                    match self
-                        .slot
-                        .compare_exchange(occupant, Some(branch), Release, Acquire)
-                    {
-                        Ok(_) => {
-                            // Check if we're done
-                            if block_slot_index != target_slot_index {
-                                return Ok(());
-                            }
-
-                            // We need to create more branches to distinguish between the two
-                            // blocks.
-                            self.slot = &branch.branch_footer().children[block_slot_index];
-                            self.bit_depth += Self::BRANCH_BITS;
-                            occupant = None;
-                            continue;
+                    Err(n_occupant) => {
+                        // Clean up and free the branch
+                        branch.right_parent.store(None, Relaxed);
+                        for i in 0..BRANCH_SIZE {
+                            branch.child(i).store(None, Relaxed);
                         }
-                        Err(n_occupant) => {
-                            // Clean up and free the branch
-                            branch.right_parent.store(None, Relaxed);
-                            for child in branch.branch_footer().children.iter() {
-                                child.store(None, Relaxed);
-                            }
-                            alloc.free_block(branch);
+                        alloc.free_block(branch);
 
-                            // Try again
-                            occupant = n_occupant;
-                            continue 'occupied;
-                        }
+                        // Try again
+                        occupant = n_occupant;
+                        continue 'occupied;
                     }
                 }
             }
@@ -1365,45 +1527,26 @@ impl<'alloc> TreeNode<'alloc> {
     }
 }
 
-/// A reference to a [`Block`] which signals that it is being "held" by the current thread.
-///
-/// This gurantees that the block is "live" for as long as the guard is held.
-///
-/// This *won't* automatically "unhold" the block when dropped, but it will panic if the block was
-/// not unheld. That's because unholding a block might require performing invalidation propogation,
-/// which requires access to an allocator and could be expensive.
-struct BlockGuard<'alloc> {
-    block: &'alloc Block<'alloc>,
-}
-
-impl std::ops::Drop for BlockGuard<'_> {
-    fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        if !std::thread::panicking() {
-            panic!("block was not unheld");
-        }
-    }
-}
-
-/// Tries to "hold" the block associated with the given token, ensuring that it remains "live" for
-/// as long as the guard is held. Returns [`None`] if the token is invalid.
-fn hold(token: Token) -> Option<BlockGuard> {
-    let mut tag = token.max_tag.0 & BlockTag::VERSION_MASK;
+/// Tries to "hold" the block associated with the given token, ensuring that it is not finalized
+/// until it is unheld. Returns [`None`] if the token is invalid.
+fn hold(token: Token) -> Option<TokenBlockHolding> {
+    let mut tag = BlockTag(token.max_tag.0 & !BlockTag::INVALID_FLAG);
     loop {
-        let n_tag = tag + 1;
+        debug_assert!(tag.is_token());
         assert!(
-            n_tag < token.max_tag.0,
+            tag.num_holders() < BlockTag::NUM_HOLDERS_MASK,
             "maximum number of holders exceeded"
         );
+        let mut n_tag = tag;
+        n_tag.0 += 1;
         match token
             .block
             .tag
-            .0
             .compare_exchange_weak(tag, n_tag, Relaxed, Relaxed)
         {
-            Ok(_) => return Some(BlockGuard { block: token.block }),
+            Ok(_) => return Some(TokenBlockHolding { block: token.block }),
             Err(e_tag) => {
-                if e_tag < token.max_tag.0 {
+                if e_tag < token.max_tag {
                     tag = e_tag;
                 } else {
                     // The token has already been invalidated.
@@ -1414,154 +1557,313 @@ fn hold(token: Token) -> Option<BlockGuard> {
     }
 }
 
-/// "Unholds" the block associated with a given [`BlockGuard`].
-fn unhold<'alloc, Alloc: Allocator<'alloc> + ?Sized>(alloc: &mut Alloc, guard: BlockGuard<'alloc>) {
+/// "Unholds" the block associated with a given [`TokenBlockHolding`].
+///
+/// If there are no remaining holders for the block preventing finalization, this will
+/// return a [`TokenBlockFinalizing`]. The calling thread is then responsible for [`finalize`]ing
+/// the block.
+#[must_use]
+fn unhold(block: TokenBlockHolding) -> Option<TokenBlockFinalizing> {
+    let guard = block;
     let block = guard.block;
     std::mem::forget(guard);
-    let o_tag = block.tag.0.fetch_sub(1, AcqRel); // Synchronizes with token unhold
-    debug_assert!(o_tag & BlockTag::HOLD_MASK > 0);
-    if o_tag & !BlockTag::VERSION_MASK == (BlockTag::INVALID_BIT + 1) {
-        fence(Release); // Synchronizes with token invalidation
-        // We were the last holder of an invalid block, so it's our responsibility to finalize it.
-        finalize(alloc, block);
+    let o_tag = BlockTag(block.tag.0.fetch_sub(1, AcqRel)); // Synchronizes with token unhold
+    debug_assert!(o_tag.is_token());
+    debug_assert!(o_tag.0 & BlockTag::NUM_HOLDERS_MASK > 0);
+    if o_tag.0 & (BlockTag::INVALID_FLAG | BlockTag::NUM_HOLDERS_MASK)
+        == (BlockTag::INVALID_FLAG + 1)
+    {
+        // The block has no remaining holders, and is invalid, so we should finalize it.
+        Some(TokenBlockFinalizing { block })
+    } else {
+        None
     }
 }
 
-/// Invalidates a [`Token`] if it has not already been invalidated. Returns `true` if the block
-/// was [`finalize`]d.
-fn invalidate_token<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
+/// "Unholds" the block associated with a given [`TokenBlockHolding`]. If the block has no
+/// remaining holders, this will [`finalize`] it.
+fn unhold_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     alloc: &mut Alloc,
-    token: Token<'alloc>,
-) -> bool {
-    // We don't want to invalidate the token if the block has already been reallocated as a new
-    // token, so we have to use `compare_exchange` instead of `fetch_or`.
-    let mut tag = token.max_tag.0 & BlockTag::VERSION_MASK;
-    loop {
-        let n_tag = tag | BlockTag::INVALID_BIT;
-        match token
-            .block
-            .tag
-            .0
-            .compare_exchange_weak(tag, n_tag, Acquire, Relaxed) // Synchronizes with token unhold
-        {
-            Ok(_) => {
-                if tag & BlockTag::HOLD_MASK == 0 {
-                    fence(Release); // Synchronizes with token invalidation
-                    // There are no holders on the block, so we can finalize it.
-                    finalize(alloc, token.block);
-                    return true;
-                } else {
-                    return false;
+    block: TokenBlockHolding<'alloc>,
+) {
+    if let Some(block) = unhold(block) {
+        let _ = finalize::<_, ()>(alloc, block);
+    }
+}
+
+/// Invalidates a [`Token`] block, assuming we have the exclusive right to do so.
+///
+/// If there are no [`TokenBlockHolding`]s on the block preventing finalization, this will
+/// return a [`TokenBlockFinalizing`]. The calling thread is then responsible for [`finalize`]ing
+/// the block. Otherwise, this will return an `Err`.
+fn invalidate_condition<'alloc, Err: FinalizeError<'alloc>>(
+    block: &'alloc Block<'alloc>,
+) -> Result<TokenBlockFinalizing<'alloc>, Err> {
+    Err::invalidate_condition(block)
+}
+
+/// Invalidates all children of a [`BlockType::Token`], attempts to finalize the children, and
+/// if successful, frees the block.
+///
+/// If it is not possible to finish finalization without blocking the current thread (e.g. a
+/// child has a [`TokenBlockHolding`] from another thread), this will "abort" the finalization
+/// and return an `Err`. Finalization will be attempted again when all holders are removed.
+/// It is guranteed to succeed on the second attempt because no new children can be added to
+/// an invalid block.
+fn finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized, Err: FinalizeError<'alloc>>(
+    alloc: &mut Alloc,
+    mut block: TokenBlockFinalizing<'alloc>,
+) -> Result<(), Err> {
+    // Set number of holders to maximum to prevent underflow
+    let mut tag = block.tag.load(Relaxed);
+    tag.0 |= BlockTag::NUM_HOLDERS_MASK;
+    block.tag.store(tag, Relaxed);
+
+    // Invalidate children
+    let mut num_holders = 0;
+    start_finalize(alloc, &mut num_holders, &mut block);
+    assert!(num_holders <= BlockTag::NUM_HOLDERS_MASK);
+
+    // Remove extraneous holders and check if we end up with no holders remaining.
+    let sub = BlockTag::NUM_HOLDERS_MASK - num_holders;
+    match FinalizeError::unhold_many(block, sub) {
+        Ok(block) => {
+            finish_finalize(alloc, block);
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// A type of error that can be produced when we aren't able to finalize a token block.
+///
+/// There are effectively two useful instances of this trait:
+///
+/// `()`: Unholds the block and ensures that the block will be finalized at a later point once
+/// all holders are removed.
+///
+/// [`TokenBlockHolding`]: Keeps a holder on the block, allowing a callback to be installed for
+/// notification of when finalization completes.
+trait FinalizeError<'alloc>: Sized {
+    /// Removes `amount` holders from the given block.
+    ///
+    /// If no holders remain, this will return an [`Ok`], otherwise this will return an [`Err`]
+    /// of this type.
+    fn unhold_many(
+        block: TokenBlockFinalizing<'alloc>,
+        amount: usize,
+    ) -> Result<TokenBlockFinalizing<'alloc>, Self>;
+
+    /// Invalidates a [`Token`] block, assuming we have the exclusive right to do so.
+    ///
+    /// If no holders remain, this will return an [`Ok`], otherwise this will return an [`Err`]
+    /// of this type.
+    fn invalidate_condition(
+        block: &'alloc Block<'alloc>,
+    ) -> Result<TokenBlockFinalizing<'alloc>, Self>;
+}
+
+impl<'alloc> FinalizeError<'alloc> for () {
+    fn unhold_many(
+        block: TokenBlockFinalizing<'alloc>,
+        amount: usize,
+    ) -> Result<TokenBlockFinalizing<'alloc>, ()> {
+        let o_tag = block.tag.0.fetch_sub(amount, AcqRel); // Synchronizes with token unhold
+        debug_assert!(o_tag & BlockTag::NUM_HOLDERS_MASK >= amount);
+        if o_tag & BlockTag::NUM_HOLDERS_MASK == amount {
+            Ok(block)
+        } else {
+            std::mem::forget(block);
+            Err(())
+        }
+    }
+
+    fn invalidate_condition(
+        block: &'alloc Block<'alloc>,
+    ) -> Result<TokenBlockFinalizing<'alloc>, Self> {
+        let o_tag = BlockTag(block.tag.0.fetch_or(BlockTag::INVALID_FLAG, Acquire)); // Synchronizes with token unhold
+        debug_assert!(o_tag.is_token());
+        debug_assert!(!o_tag.is_invalid());
+        if o_tag.num_holders() == 0 {
+            Ok(TokenBlockFinalizing { block })
+        } else {
+            Err(())
+        }
+    }
+}
+
+impl<'alloc> FinalizeError<'alloc> for TokenBlockHolding<'alloc> {
+    fn unhold_many(
+        block: TokenBlockFinalizing<'alloc>,
+        amount: usize,
+    ) -> Result<TokenBlockFinalizing<'alloc>, TokenBlockHolding<'alloc>> {
+        debug_assert!(amount > 0);
+
+        // Try to remove all holders from the block. If this is not possible, leave one extra
+        // holder to be returned as an error.
+        let mut tag = block.tag.load(Relaxed);
+        loop {
+            let mut n_tag = tag;
+            debug_assert!(tag.num_holders() >= amount);
+            if tag.num_holders() == amount {
+                n_tag.0 &= !BlockTag::NUM_HOLDERS_MASK;
+
+                // Since there are no holders remaining, we don't even need to use atomic
+                // operations here.
+                block.tag.store(n_tag, Relaxed);
+                return Ok(block);
+            } else if amount > 1 {
+                n_tag.0 -= amount - 1;
+                match block.tag.compare_exchange_weak(tag, n_tag, AcqRel, Acquire) {
+                    // Synchronizes with token unhold
+                    Ok(_) => return Err(TokenBlockHolding { block: block.block }),
+                    Err(n_tag) => {
+                        debug_assert_eq!(
+                            tag.0 & !BlockTag::NUM_HOLDERS_MASK,
+                            n_tag.0 & !BlockTag::NUM_HOLDERS_MASK
+                        );
+                        tag = n_tag;
+                        continue;
+                    }
                 }
+            } else {
+                return Err(TokenBlockHolding { block: block.block });
             }
-            Err(e_tag) => {
-                if e_tag < token.max_tag.0 {
-                    tag = e_tag;
-                } else {
-                    // The token has already been invalidated.
-                    return false;
+        }
+    }
+
+    fn invalidate_condition(
+        block: &'alloc Block<'alloc>,
+    ) -> Result<TokenBlockFinalizing<'alloc>, Self> {
+        let mut tag = block.tag.load(Relaxed);
+        loop {
+            debug_assert!(tag.is_token());
+            debug_assert!(!tag.is_invalid());
+            let mut n_tag = tag;
+            n_tag.0 |= BlockTag::INVALID_FLAG; // Set invalid flag
+            if tag.num_holders() == 0 {
+                match block.tag.compare_exchange_weak(tag, n_tag, AcqRel, Acquire) {
+                    // Synchronizes with token unhold
+                    Ok(_) => return Ok(TokenBlockFinalizing { block }),
+                    Err(n_tag) => {
+                        debug_assert_eq!(
+                            tag.0 & !BlockTag::NUM_HOLDERS_MASK,
+                            n_tag.0 & !BlockTag::NUM_HOLDERS_MASK
+                        );
+                        tag = n_tag;
+                        continue;
+                    }
+                }
+            } else {
+                assert!(
+                    tag.num_holders() < BlockTag::NUM_HOLDERS_MASK,
+                    "maximum number of holders exceeded"
+                );
+                let mut n_tag = tag;
+                n_tag.0 += 1;
+                match block.tag.compare_exchange_weak(tag, n_tag, AcqRel, Acquire) {
+                    // Synchronizes with token unhold
+                    Ok(_) => return Err(TokenBlockHolding { block }),
+                    Err(n_tag) => {
+                        debug_assert_eq!(
+                            tag.0 & !BlockTag::NUM_HOLDERS_MASK,
+                            n_tag.0 & !BlockTag::NUM_HOLDERS_MASK
+                        );
+                        tag = n_tag;
+                        continue;
+                    }
                 }
             }
         }
     }
 }
 
-/// Invalidates a [`Token`] block that we have exclusive ownership of.
+/// Invalidates all children of a [`BlockType::Token`] block.
 ///
-/// This is the internal implementation of [`Condition::invalidate_eventually`].
-fn invalidate_condition<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
-    alloc: &mut Alloc,
-    block: &'alloc Block<'alloc>,
-) {
-    let o_tag = block.tag.0.fetch_or(BlockTag::INVALID_BIT, Acquire); // Synchronizes with token unhold
-    debug_assert!(o_tag & BlockTag::INVALID_BIT == 0);
-    if o_tag & !BlockTag::VERSION_MASK == 0 {
-        fence(Release); // Synchronizes with token invalidation
-        // There are no holders of this block, so we can finalize it ourselves.
-        finalize(alloc, block);
-    }
-}
-
-/// Performs invalidation propogation on a [`Token`] block and frees it.
+/// This will attempt to finalize children that have no [`TokenBlockHolding`]s. For any child
+/// that can not be completely finalized, this will set its [`BlockTag::HOLDING_LEFT_FLAG`]
+/// or [`BlockTag::HOLDING_RIGHT_FLAG`] (depending on what kind of child it is) and increment
+/// `num_holders`. Thus, at the end of the call, `num_holders` will be the total number of children
+/// that are preventing finalization from completing.
 ///
-/// The block must be not be live, and the current thread must have been the thread which last
-/// set its tag.
-fn finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
+/// Note that it is possible for children to be finalized while this is still running, in which
+/// case they will decrement `NUM_HOLDERS` in `block.tag`. To prevent underflow, `NUM_HOLDERS`
+/// should be set to its maximum value before calling this function, and then corrected afterwards
+/// using `num_holders`.
+///
+/// It is guranteed that after this call, there will be no children in either the left child
+/// list or the right search tree.
+fn start_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     alloc: &mut Alloc,
-    block: &'alloc Block<'alloc>,
+    num_holders: &mut usize,
+    block: &mut TokenBlockFinalizing<'alloc>,
 ) {
-    // Remove from left parent's list of children
-    if let Some(left_parent) = block.left_parent.load(Relaxed) {
-        remove_left_child(left_parent, block);
-
-        // Clean up links to left parent
-        block // Synchronizes with left parent removal
-            .left_parent
-            .store(None, Release);
-        block.token_footer().prev_left_sibling.store(None, Relaxed);
-        block // Synchronizes with left sibling removal
-            .token_footer()
-            .next_left_sibling
-            .store(SiblingBlockRef::NONE, Release);
-    }
-
     // Invalidate right children
-    invalidate_right(alloc, block, &block.token_footer().right_tree);
+    let right_tree = block.block.right_tree();
+    invalidate_right(alloc, num_holders, block, right_tree);
     fn invalidate_right<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
         alloc: &mut Alloc,
-        right_parent: &'alloc Block<'alloc>,
-        slot: &Atomic<Option<&'alloc Block<'alloc>>>,
+        num_holders: &mut usize,
+        right_parent: &mut TokenBlockFinalizing<'alloc>,
+        slot: &Atomic<Option<&'alloc Block<'alloc>>, *mut Block<'alloc>>,
     ) {
-        // No other thread is allowed to modify the slot, so we can safely read it without
-        // synchronization.
-        let Some(block) = slot.load(Acquire) else {
+        let block = slot.load(Acquire); // Synchronizes with block publication
+        if block.is_null() {
             return;
-        };
+        }
+
+        // SAFETY: No other thread is allowed to modify the right tree, so we can guarantee that
+        // all slots in the tree are valid references to a `Block`.
+        let block: &'alloc Block<'alloc> = unsafe { &*block };
         slot.store(None, Relaxed);
 
-        // Assuming that this block is a token block (which might not be the case), grab a `Token`
-        // for it now so that we can verify if it was invalidated later.
-        let token = block.token();
+        // Get the tag for the block before checking `block.right_parent` so we know that we
+        // got the correct tag.
+        let tag = block.tag.load(Acquire); // Synchronizes with version increment
 
         // Check whether the block actually belongs to this tree. It's possible for an old
         // member of the tree to be freed and reallocated as a new unrelated block.
-        if !std::ptr::eq(block.right_parent.0.load(Relaxed), right_parent) {
+        if !std::ptr::eq(
+            HasAtomic::into_prim(block.right_parent.load(Relaxed)),
+            right_parent.block,
+        ) {
             return;
         }
 
-        // Check whether this is a branch block
-        if block.left_parent.load(Relaxed).is_some() {
-            fence(Acquire); // Synchronizes with token invalidation
-            invalidate_token(alloc, token);
-        } else {
-            for slot in block.branch_footer().children.iter() {
-                invalidate_right(alloc, right_parent, slot);
+        // If this is a branch block, invalidate its children recursively, then free it.
+        if !tag.is_token() {
+            for i in 0..BRANCH_SIZE {
+                invalidate_right(alloc, num_holders, right_parent, block.child(i));
             }
             block.right_parent.store(None, Relaxed);
             alloc.free_block(block);
+            return;
+        }
+
+        // Try to invalidate right child token
+        if let Ok(block) = invalidate_token(BlockTag::HOLDING_RIGHT_FLAG, block, tag) {
+            *num_holders += 1;
+            if let Some(block) = block {
+                let _ = finalize::<_, ()>(alloc, block);
+            }
         }
     }
 
     // Invalidate left children
-    let mut opt_first_child = block.token_footer().first_left_child.load(Relaxed);
+    let mut opt_first_child = block.first_left_child().load(Relaxed);
     while let Some(first_child) = opt_first_child {
         // Verify that this is still a left child of `block`.
-        let first_child = first_child.token();
-        let first_child_prev_sibling = first_child
-            .block
-            .token_footer()
-            .prev_left_sibling
-            .load(Relaxed);
+        let tag = first_child.tag.load(Acquire); // Synchronizes with version increment
+        let first_child_prev_sibling = first_child.prev_left_sibling().load(Relaxed);
         let first_child_parent = first_child // Synchronizes with left parent removal
-            .block
-            .left_parent
+            .left_parent()
             .load(Acquire);
-        if !std::ptr::eq(HasAtomic::into_prim(first_child_parent), block) {
+        if !std::ptr::eq(HasAtomic::into_prim(first_child_parent), block.block) {
             // Before `left_child` was invalidated, it must have removed itself from the
             // left children list.
-            opt_first_child = block.token_footer().first_left_child.load(Relaxed);
+            opt_first_child = block.first_left_child().load(Relaxed);
             debug_assert!(
-                !std::ptr::eq(HasAtomic::into_prim(opt_first_child), first_child.block),
+                !std::ptr::eq(HasAtomic::into_prim(opt_first_child), first_child),
                 "parent is none: {}",
                 first_child_parent.is_none()
             );
@@ -1572,46 +1874,186 @@ fn finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
         // siblings.
         debug_assert!(first_child_prev_sibling.is_none());
 
-        // Try to invalidate the child
-        if invalidate_token(alloc, first_child) {
-            // Since we just ran finalization on this thread, the child should have removed
-            // itself from the left children list.
-            opt_first_child = block.token_footer().first_left_child.load(Relaxed);
-            debug_assert!(!std::ptr::eq(
-                HasAtomic::into_prim(block.token_footer().first_left_child.load(Relaxed)),
-                first_child.block
-            ));
-        } else {
-            // This child is already scheduled to be invalidated by another thread, so we can
-            // safely remove it from the list.
-            opt_first_child = force_remove_left_child(block, first_child.block);
+        // Is this a callback block?
+        if !tag.is_token() {
+            // Read callback information and free the block
+            let callback_fn = unsafe {
+                let protected = &mut *first_child.protected.get();
+                let callback_fn = protected.callback_fn;
+                protected.first_left_child = ManuallyDrop::new(Atomic::new(None));
+                callback_fn
+            };
+            let callback_data = first_child.callback_data().load(Relaxed);
+            first_child
+                .callback_data()
+                .store(std::ptr::null_mut(), Relaxed);
+            opt_first_child = force_remove_left_child(&*block, first_child);
+            first_child.left_parent().store(None, Relaxed);
+            first_child
+                .next_left_sibling()
+                .store(SiblingBlockRef::NONE, Relaxed);
+            first_child.prev_left_sibling().store(None, Relaxed);
+            alloc.free_block(first_child);
+
+            // Call the callback
+            unsafe { callback_fn(callback_data) };
+            continue;
         }
+
+        // Try to invalidate left child token
+        *num_holders += 1;
+        if let Some(first_child) = invalidate_token(BlockTag::HOLDING_LEFT_FLAG, first_child, tag)
+            .expect("finalized token should not be in left child list")
+        {
+            if finalize::<_, ()>(alloc, first_child).is_ok() {
+                // Since we just ran finalization on this thread, the child should have removed
+                // itself from the left children list.
+                let old_opt_first_child = opt_first_child;
+                opt_first_child = block.first_left_child().load(Relaxed);
+                debug_assert!(!std::ptr::eq(
+                    HasAtomic::into_prim(opt_first_child),
+                    HasAtomic::into_prim(old_opt_first_child)
+                ));
+                continue;
+            }
+        }
+
+        // This child needs to be finalized by another thread. Let's just get it out of the
+        // way for now.
+        opt_first_child = force_remove_left_child(&*block, first_child);
+    }
+}
+
+/// Completes [`finalize`]ing a block after it is known that all of its children have been
+/// finalized.
+fn finish_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
+    alloc: &mut Alloc,
+    mut block: TokenBlockFinalizing<'alloc>,
+) {
+    let tag = block.tag.load(Relaxed);
+    debug_assert!(tag.is_token());
+    debug_assert!(tag.is_invalid());
+    debug_assert_eq!(tag.num_holders(), 0);
+
+    // Clean up links to left parent
+    if let Some(left_parent) = block.left_parent().load(Relaxed) {
+        remove_left_child(left_parent, &mut block);
+        if tag.is_holding_left() {
+            unhold_finalize(alloc, TokenBlockHolding { block: left_parent });
+        }
+        block // Synchronizes with left parent removal
+            .left_parent()
+            .store(None, Release);
+        block.prev_left_sibling().store(None, Relaxed);
+        block // Synchronizes with left sibling removal
+            .next_left_sibling()
+            .store(SiblingBlockRef::NONE, Release);
     }
 
-    // Free block
-    block.right_parent.store(None, Relaxed);
+    // Clean up links to right parent
+    if let Some(right_parent) = block.right_parent.load(Relaxed) {
+        if tag.is_holding_right() {
+            unhold_finalize(
+                alloc,
+                TokenBlockHolding {
+                    block: right_parent,
+                },
+            );
+        }
+        block.right_parent.store(None, Relaxed);
+    }
+
+    // Free the block
+    let guard = block;
+    let block = guard.block;
+    std::mem::forget(guard);
+    block.tag.store(tag.next(), Release); // Synchronizes with version increment
     alloc.free_block(block);
+}
+
+/// Attempts to invalidate a [`Token`], returning `Err` if it has already been finalized.
+///
+/// If the block has not yet been finalized, this will set the `holding_flag` on its tag. If
+/// there are no [`TokenBlockHolding`]s on the block preventing finalization, this will return
+/// a [`TokenBlockFinalizing`].
+fn invalidate_token<'alloc>(
+    holding_flag: usize,
+    block: &'alloc Block<'alloc>,
+    mut tag: BlockTag,
+) -> Result<Option<TokenBlockFinalizing<'alloc>>, ()> {
+    debug_assert_eq!(
+        holding_flag & !(BlockTag::HOLDING_LEFT_FLAG | BlockTag::HOLDING_RIGHT_FLAG),
+        0
+    );
+
+    // We don't want to invalidate the token if the block has already been reallocated as a new
+    // token, so we have to use `compare_exchange` instead of `fetch_or`.
+    loop {
+        let mut n_tag = tag;
+        n_tag.0 |= BlockTag::INVALID_FLAG;
+        n_tag.0 |= holding_flag;
+        match block
+            .tag
+            .compare_exchange_weak(tag, n_tag, Acquire, Relaxed) // Synchronizes with token unhold
+        {
+            Ok(tag) => {
+                // Are we responsible for finalizing the block?
+                return Ok(if !tag.is_invalid() && tag.num_holders() == 0 {
+                    Some(TokenBlockFinalizing {
+                        block,
+                    })
+                } else {
+                    None
+                });
+            }
+            Err(e_tag) => {
+                if e_tag.0 & BlockTag::VERSION_MASK <= tag.0 & BlockTag::VERSION_MASK {
+                    debug_assert!(e_tag.is_token());
+                    tag = e_tag;
+                    continue;
+                } else {
+                    // The token has already been finalized.
+                    return Err(());
+                }
+            }
+        }
+    }
+}
+
+/// Adds a [`BlockType::Callback`] block to the list of children of a token [`Block`].
+/// This callback will be called when the token is finalized.
+unsafe fn install_callback<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
+    alloc: &mut Alloc,
+    block: &TokenBlockHolding<'alloc>,
+    callback_fn: unsafe fn(*mut ()),
+    callback_data: *mut (),
+) {
+    let callback = alloc.allocate_block();
+    callback.verify_clean();
+    unsafe { (*callback.protected.get()).callback_fn = callback_fn }
+    callback.callback_data().store(callback_data, Relaxed);
+    callback.left_parent().store(Some(block.block), Relaxed);
+    insert_left_child(alloc, block, callback);
 }
 
 /// Inserts a token [`Block`] into the list of children of its left parent.
 fn insert_left_child<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     alloc: &mut Alloc,
-    left_guard: &BlockGuard<'alloc>,
+    left_parent: &TokenBlockHolding<'alloc>,
     block: &'alloc Block<'alloc>,
 ) {
-    let first_child_slot = &left_guard.block.token_footer().first_left_child;
+    let first_child_slot = &left_parent.first_left_child();
     let mut opt_first_child = first_child_slot.load(Acquire);
     loop {
         block
-            .token_footer()
-            .next_left_sibling
+            .next_left_sibling()
             .store(SiblingBlockRef::new(opt_first_child, false), Relaxed);
         if let Some(first_child) = opt_first_child {
             // Before inserting a new child at the front of the list, we will hold the current
             // first child. This greatly simplifies the logic for lock-free removal of an
             // arbitrary child in the list because we won't have to worry about
             // `prev_left_sibling` being out of date.
-            if let Some(first_child_guard) = hold(first_child.token()) {
+            if let Some(first_child) = hold(first_child.token()) {
                 match first_child_slot.compare_exchange_weak(
                     opt_first_child,
                     Some(block),
@@ -1619,22 +2061,19 @@ fn insert_left_child<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
                     Acquire,
                 ) {
                     Ok(_) => {
-                        first_child
-                            .token_footer()
-                            .prev_left_sibling
-                            .store(Some(block), Release);
-                        unhold(alloc, first_child_guard);
+                        first_child.prev_left_sibling().store(Some(block), Release);
+                        unhold_finalize(alloc, first_child);
                         break;
                     }
                     Err(n_opt_first_child) => {
-                        unhold(alloc, first_child_guard);
+                        unhold_finalize(alloc, first_child);
                         opt_first_child = n_opt_first_child;
                         continue;
                     }
                 }
             } else {
                 // Remove invalid child from list
-                opt_first_child = force_remove_left_child(left_guard.block, first_child);
+                opt_first_child = force_remove_left_child(left_parent, first_child);
                 continue;
             }
         } else {
@@ -1650,28 +2089,27 @@ fn insert_left_child<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     }
 }
 
-/// Removes a [`Token`] block from the list of children of its left parent. This assumes that
-/// `block` is not live and the current thread owns it.
-fn remove_left_child<'alloc>(left_parent: &'alloc Block<'alloc>, block: &'alloc Block<'alloc>) {
+/// Removes a [`Token`] block from the list of children of its left parent.
+fn remove_left_child<'alloc>(
+    left_parent: &'alloc Block<'alloc>,
+    block: &mut TokenBlockFinalizing<'alloc>,
+) {
     // First, we mark `next_left_sibling` as removing so that if `to_sibling` is itself being
     // removed, it will not try to modify our `next_left_sibling`, which we will no longer read.
-    let to_sibling = block
-        .token_footer()
-        .next_left_sibling
-        .mark_removing(Relaxed);
+    let to_sibling = block.block.next_left_sibling().mark_removing(Relaxed);
 
     // Ensure that `block` is no longer in the list of children.
     let between_siblings = BlockList {
-        head: block,
+        head: block.block,
         tail: None,
     };
     loop {
-        let prev_sibling = block.token_footer().prev_left_sibling.load(Relaxed);
+        let prev_sibling = block.prev_left_sibling().load(Relaxed);
         if update(
             left_parent,
             prev_sibling,
             &between_siblings,
-            block,
+            block.block,
             to_sibling,
         ) {
             return;
@@ -1701,20 +2139,17 @@ fn remove_left_child<'alloc>(left_parent: &'alloc Block<'alloc>, block: &'alloc 
         to_sibling: Option<&'alloc Block<'alloc>>,
     ) -> bool {
         if let Some(from_sibling) = opt_from_sibling {
-            match from_sibling
-                .token_footer()
-                .next_left_sibling
-                .compare_exchange_weak(
-                    SiblingBlockRef::new(Some(before_to_sibling), false),
-                    SiblingBlockRef::new(to_sibling, false),
-                    Relaxed,
-                    Acquire, // Synchronizes with left sibling removal
-                ) {
+            match from_sibling.next_left_sibling().compare_exchange_weak(
+                SiblingBlockRef::new(Some(before_to_sibling), false),
+                SiblingBlockRef::new(to_sibling, false),
+                Relaxed,
+                Acquire, // Synchronizes with left sibling removal
+            ) {
                 Ok(_) => (),
                 Err(e_next_sibling) => {
                     // Ensure that `from_sibling` is still in the list of children.
                     if !std::ptr::eq(
-                        HasAtomic::into_prim(from_sibling.left_parent.load(Relaxed)),
+                        HasAtomic::into_prim(from_sibling.left_parent().load(Relaxed)),
                         left_parent,
                     ) {
                         return false;
@@ -1723,8 +2158,7 @@ fn remove_left_child<'alloc>(left_parent: &'alloc Block<'alloc>, block: &'alloc 
                     // If `from_sibling` is currently being removed, help it out by looking
                     // further back in the list.
                     if e_next_sibling.is_removing() {
-                        let prev_from_sibling =
-                            from_sibling.token_footer().prev_left_sibling.load(Relaxed);
+                        let prev_from_sibling = from_sibling.prev_left_sibling().load(Relaxed);
                         let between_siblings = BlockList {
                             head: from_sibling,
                             tail: Some(between_siblings),
@@ -1739,8 +2173,7 @@ fn remove_left_child<'alloc>(left_parent: &'alloc Block<'alloc>, block: &'alloc 
                     } else if let Some(e_next_sibling) = e_next_sibling.source() {
                         if contains(between_siblings, e_next_sibling) {
                             if from_sibling
-                                .token_footer()
-                                .next_left_sibling
+                                .next_left_sibling()
                                 .compare_exchange_weak(
                                     SiblingBlockRef::new(Some(e_next_sibling), false),
                                     SiblingBlockRef::new(to_sibling, false),
@@ -1763,20 +2196,20 @@ fn remove_left_child<'alloc>(left_parent: &'alloc Block<'alloc>, block: &'alloc 
                 }
             }
         } else {
-            match left_parent
-                .token_footer()
-                .first_left_child
-                .compare_exchange_weak(Some(before_to_sibling), to_sibling, Relaxed, Relaxed)
-            {
+            let first_left_child = unsafe { left_parent.first_left_child() };
+            match first_left_child.compare_exchange_weak(
+                Some(before_to_sibling),
+                to_sibling,
+                Relaxed,
+                Relaxed,
+            ) {
                 Ok(_) => (),
                 Err(None) => {
                     // The list is empty, so `before_to_sibling` is not in the list.
                 }
                 Err(Some(e_first_sibling)) => {
                     if contains(between_siblings, e_first_sibling) {
-                        if left_parent
-                            .token_footer()
-                            .first_left_child
+                        if first_left_child
                             .compare_exchange_weak(
                                 Some(e_first_sibling),
                                 to_sibling,
@@ -1825,38 +2258,33 @@ fn remove_left_child<'alloc>(left_parent: &'alloc Block<'alloc>, block: &'alloc 
     }
 }
 
-/// Removes a [`Token`] block from the beginning of the list of children of its left parent. This
-/// assumes that `block` is invalid, but unlike [`remove_left_child`], it does not require that
-/// the current thread owns it.
+/// Removes a block from the beginning of the list of children of its left parent.
+/// Unlike [`remove_left_child`], this does not require a [`TokenBlockFinalizing`].
 ///
 /// Returns the next child in the list, or [`None`] if there are no more children.
 fn force_remove_left_child<'alloc>(
-    left_parent: &'alloc Block<'alloc>,
+    left_parent: &TokenBlockHolding<'alloc>,
     block: &'alloc Block<'alloc>,
 ) -> Option<&'alloc Block<'alloc>> {
-    let mut next_sibling = block.token_footer().next_left_sibling.load(Relaxed);
+    let mut next_sibling = block.next_left_sibling().load(Relaxed);
     loop {
-        let block_parent = block.left_parent.load(Acquire); // Synchronizes with left parent removal
-        if !std::ptr::eq(HasAtomic::into_prim(block_parent), left_parent) {
+        let block_parent = block.left_parent().load(Acquire); // Synchronizes with left parent removal
+        if !std::ptr::eq(HasAtomic::into_prim(block_parent), left_parent.block) {
             // `block` has already removed itself from the list of children. Now the first child
             // should be some other block.
-            let first_child = left_parent.token_footer().first_left_child.load(Relaxed);
+            let first_child = left_parent.first_left_child().load(Relaxed);
             debug_assert!(!std::ptr::eq(HasAtomic::into_prim(first_child), block));
             return first_child;
         }
 
         // Mark `block` as removing
         if !next_sibling.is_removing() {
-            if let Err(n_next_sibling) = block
-                .token_footer()
-                .next_left_sibling
-                .compare_exchange_weak(
-                    next_sibling,
-                    SiblingBlockRef::new(next_sibling.source(), true),
-                    Relaxed,
-                    Relaxed,
-                )
-            {
+            if let Err(n_next_sibling) = block.next_left_sibling().compare_exchange_weak(
+                next_sibling,
+                SiblingBlockRef::new(next_sibling.source(), true),
+                Relaxed,
+                Relaxed,
+            ) {
                 next_sibling = n_next_sibling;
                 continue;
             }
@@ -1864,11 +2292,12 @@ fn force_remove_left_child<'alloc>(
         let next_sibling = next_sibling.source();
 
         // Attempt to remove `block` from the list of children.
-        match left_parent
-            .token_footer()
-            .first_left_child
-            .compare_exchange_weak(Some(block), next_sibling, Relaxed, Relaxed)
-        {
+        match left_parent.first_left_child().compare_exchange_weak(
+            Some(block),
+            next_sibling,
+            Relaxed,
+            Relaxed,
+        ) {
             Ok(_) => {
                 fix_prev(None, block, next_sibling);
                 return next_sibling;
@@ -1903,11 +2332,12 @@ fn fix_prev<'alloc>(
     };
     let mut prev_to_sibling = before_to_sibling;
     'retry: loop {
-        match to_sibling
-            .token_footer()
-            .prev_left_sibling
-            .compare_exchange_weak(Some(prev_to_sibling), opt_from_sibling, Relaxed, Relaxed)
-        {
+        match to_sibling.prev_left_sibling().compare_exchange_weak(
+            Some(prev_to_sibling),
+            opt_from_sibling,
+            Relaxed,
+            Relaxed,
+        ) {
             Ok(_) | Err(None) => return,
             Err(Some(n_prev_to_sibling)) => {
                 // Check if `before_to_sibling` is reachable from `n_prev_to_sibling`.
@@ -1922,7 +2352,7 @@ fn fix_prev<'alloc>(
                         // `before_to_sibling`.
                         return;
                     } else if let Some(n_test_sibling) =
-                        test_sibling.token_footer().prev_left_sibling.load(Relaxed)
+                        test_sibling.prev_left_sibling().load(Relaxed)
                     {
                         test_sibling = n_test_sibling;
                     } else {
@@ -1930,6 +2360,65 @@ fn fix_prev<'alloc>(
                     }
                 }
             }
+        }
+    }
+}
+
+/// A wrapper over a `&'alloc Block<'alloc>` for a [`BlockType::Token`] [`Block`] that is being
+/// "held".
+///
+/// Blocks may not be finalized until all of their holders are removed. The last holder of an
+/// invalidated block is responsible for finalizing it.
+#[repr(transparent)]
+struct TokenBlockHolding<'alloc> {
+    block: &'alloc Block<'alloc>,
+}
+
+impl<'alloc> TokenBlockHolding<'alloc> {
+    /// Gets the [`Protected::first_left_child`] field of this block.
+    fn first_left_child(&self) -> &Atomic<Option<&'alloc Block<'alloc>>> {
+        // SAFETY: `block` must be a token block while we are holding a `TokenBlockHolding`.
+        unsafe { self.block.first_left_child() }
+    }
+}
+
+impl<'alloc> std::ops::Deref for TokenBlockHolding<'alloc> {
+    type Target = Block<'alloc>;
+    fn deref(&self) -> &Self::Target {
+        self.block
+    }
+}
+
+impl std::ops::Drop for TokenBlockHolding<'_> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        if !std::thread::panicking() {
+            panic!("block was not unheld");
+        }
+    }
+}
+
+/// A wrapper over a `&'alloc Block<'alloc>` for a [`BlockType::Token`] [`Block`] that the owner
+/// is responsible for finalizing.
+///
+/// This is an exclusive status that permits additional operations necessary for finalization.
+#[repr(transparent)]
+struct TokenBlockFinalizing<'alloc> {
+    block: &'alloc Block<'alloc>,
+}
+
+impl<'alloc> std::ops::Deref for TokenBlockFinalizing<'alloc> {
+    type Target = TokenBlockHolding<'alloc>;
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::mem::transmute(self) }
+    }
+}
+
+impl std::ops::Drop for TokenBlockFinalizing<'_> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        if !std::thread::panicking() {
+            panic!("block was not freed");
         }
     }
 }
