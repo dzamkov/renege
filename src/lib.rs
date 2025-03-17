@@ -137,6 +137,21 @@ mod global {
     }
 
     /// Tracks the validity of an arbitrary set of [`Condition`]s.
+    /// 
+    /// Tokens can be combined using the `&` operator. i.e. `a & b` is valid if and only if
+    /// `a` and `b` are both valid.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// # use renege::{Condition, Token};
+    /// let a = Condition::new();
+    /// let b = Condition::new();
+    /// let a_b = a.token() & b.token();
+    /// assert!(a_b.is_valid());
+    /// drop(a);
+    /// assert!(!a_b.is_valid());
+    /// ```
     #[derive(PartialEq, Eq, Clone, Copy)]
     pub struct Token(alloc::Token<'static>);
 
@@ -181,6 +196,15 @@ mod global {
         /// This will never block the current thread. If this token is already invalid, the call to
         /// `f()` will happen immediately.  The call to `f()` will happen exactly once, and may 
         /// occur on any thread. It should not block the calling thread.
+        /// 
+        /// # Examples
+        /// 
+        /// ```
+        /// # use renege::{Condition, Token};
+        /// let cond = Condition::new();
+        /// cond.token().on_invalid(|| println!("Token invalidated!"));
+        /// drop(cond); // Prints "Token invalidated!" 
+        /// ```
         pub fn on_invalid(self, f: impl FnOnce() + Send + 'static) {
             let inner = alloc::Token::from(self);
             alloc::Global::with(|alloc| inner.on_invalid(alloc, f));

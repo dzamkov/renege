@@ -71,14 +71,20 @@ assert!(!normality.is_valid());
 
 ## Features
 
+* Zero dependencies.
+
 * `Token::is_valid()` is extremely fast, requiring just a single atomic read, regardless of how
 many conditions it's tracking.
 
 * **Fully concurrent:** `Condition`s and `Token`s can freely be sent between threads. Invalidations
-on one thread will propogate to all other threads. All common operations are
+on one thread will propogate to all other threads. All operations on `Token`s are
 [lock-free](https://en.wikipedia.org/wiki/Non-blocking_algorithm).
 
 * Aggressive deduplication ensures that at most one `Token` is created for a given set of
 `Condition`s, regardless of how and where it is constructed. e.g. Assuming `a`, `b`, and `c` are
 all tokens, one thread can build `(a & b) & (b & c)` while another thread builds `a & b & c`,
 and they will both end up with the same `Token` sharing the same underlying storage.
+
+* **Notification:** Use
+[`Token::on_invalid`](https://docs.rs/renege/latest/renege/struct.Token.html#method.on_invalid)
+to set up a callback that will be called when a token is invalidated.
