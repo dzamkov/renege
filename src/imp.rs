@@ -161,7 +161,7 @@ impl<'alloc> Condition<'alloc> {
     ) -> bool {
         let block = self.block;
         let block = match invalidate_condition::<TokenBlockHolding<'alloc>>(block) {
-            Ok(block) => match finalize::<_, TokenBlockHolding<'alloc>>(alloc, block) {
+            Ok(block) => match finalize::<_, TokenBlockHolding<'alloc>>(alloc, block, None, None) {
                 Ok(_) => return true,
                 Err(block) => block,
             },
@@ -225,7 +225,7 @@ impl<'alloc> Condition<'alloc> {
     pub fn invalidate_eventually<Alloc: Allocator<'alloc> + ?Sized>(self, alloc: &mut Alloc) {
         let block = self.block;
         if let Ok(block) = invalidate_condition::<()>(block) {
-            let _ = finalize::<_, ()>(alloc, block);
+            let _ = finalize::<_, ()>(alloc, block, None, None);
         }
     }
 
@@ -1638,7 +1638,7 @@ fn unhold(block: TokenBlockHolding) -> Option<TokenBlockFinalizing> {
     std::mem::forget(guard);
     let o_tag = BlockTag(block.tag.0.fetch_sub(1, AcqRel)); // Synchronizes with token unhold
     debug_assert!(o_tag.is_token());
-    debug_assert!(o_tag.0 & BlockTag::NUM_HOLDERS_MASK > 0);
+    debug_assert!(o_tag.num_holders() > 0);
     if o_tag.0 & (BlockTag::INVALID_FLAG | BlockTag::NUM_HOLDERS_MASK)
         == (BlockTag::INVALID_FLAG + 1)
     {
@@ -1656,7 +1656,7 @@ fn unhold_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     block: TokenBlockHolding<'alloc>,
 ) {
     if let Some(block) = unhold(block) {
-        let _ = finalize::<_, ()>(alloc, block);
+        let _ = finalize::<_, ()>(alloc, block, None, None);
     }
 }
 
@@ -1679,9 +1679,17 @@ fn invalidate_condition<'alloc, Err: FinalizeError<'alloc>>(
 /// and return an `Err`. Finalization will be attempted again when all holders are removed.
 /// It is guranteed to succeed on the second attempt because no new children can be added to
 /// an invalid block.
+///
+/// If the block is holding its left or right parent, and the corresponding `left_num_holders` or
+/// `right_num_holders` is not `None`, then this will prefer to decrement the given counter
+/// rather than the parent block's `NUM_HOLDERS` tag. This is much quicker than an atomic
+/// decrement and can prevent underflow in the case where a single block has many children that
+/// are holding it.
 fn finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized, Err: FinalizeError<'alloc>>(
     alloc: &mut Alloc,
     mut block: TokenBlockFinalizing<'alloc>,
+    left_num_holders: Option<&mut usize>,
+    right_num_holders: Option<&mut usize>,
 ) -> Result<(), Err> {
     // Set number of holders to maximum to prevent underflow
     let mut tag = block.tag.load(Relaxed);
@@ -1697,7 +1705,7 @@ fn finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized, Err: FinalizeError<'alloc
     let sub = BlockTag::NUM_HOLDERS_MASK - num_holders;
     match FinalizeError::unhold_many(block, sub) {
         Ok(block) => {
-            finish_finalize(alloc, block);
+            finish_finalize(alloc, block, left_num_holders, right_num_holders);
             Ok(())
         }
         Err(err) => Err(err),
@@ -1912,7 +1920,7 @@ fn start_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
         if let Ok(block) = invalidate_token(BlockTag::HOLDING_RIGHT_FLAG, block, tag) {
             *num_holders += 1;
             if let Some(block) = block {
-                let _ = finalize::<_, ()>(alloc, block);
+                let _ = finalize::<_, ()>(alloc, block, None, Some(num_holders));
             }
         }
     }
@@ -1973,7 +1981,7 @@ fn start_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
         if let Some(first_child) = invalidate_token(BlockTag::HOLDING_LEFT_FLAG, first_child, tag)
             .expect("finalized token should not be in left child list")
         {
-            if finalize::<_, ()>(alloc, first_child).is_ok() {
+            if finalize::<_, ()>(alloc, first_child, Some(num_holders), None).is_ok() {
                 // Since we just ran finalization on this thread, the child should have removed
                 // itself from the left children list.
                 let old_opt_first_child = opt_first_child;
@@ -1997,6 +2005,8 @@ fn start_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
 fn finish_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     alloc: &mut Alloc,
     mut block: TokenBlockFinalizing<'alloc>,
+    left_num_holders: Option<&mut usize>,
+    right_num_holders: Option<&mut usize>,
 ) {
     let tag = block.tag.load(Relaxed);
     debug_assert!(tag.is_token());
@@ -2007,7 +2017,11 @@ fn finish_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     if let Some(left_parent) = block.left_parent().load(Relaxed) {
         remove_left_child(left_parent, &mut block);
         if tag.is_holding_left() {
-            unhold_finalize(alloc, TokenBlockHolding { block: left_parent });
+            if let Some(left_num_holders) = left_num_holders {
+                *left_num_holders -= 1;
+            } else {
+                unhold_finalize(alloc, TokenBlockHolding { block: left_parent });
+            }
         }
         block // Synchronizes with left parent removal
             .left_parent()
@@ -2021,12 +2035,16 @@ fn finish_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     // Clean up links to right parent
     if let Some(right_parent) = block.right_parent.load(Relaxed) {
         if tag.is_holding_right() {
-            unhold_finalize(
-                alloc,
-                TokenBlockHolding {
-                    block: right_parent,
-                },
-            );
+            if let Some(right_num_holders) = right_num_holders {
+                *right_num_holders -= 1;
+            } else {
+                unhold_finalize(
+                    alloc,
+                    TokenBlockHolding {
+                        block: right_parent,
+                    },
+                );
+            }
         }
         block.right_parent.store(None, Relaxed);
     }

@@ -166,6 +166,45 @@ fn test_invalidate_from() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+fn test_invalidate_big_left() {
+    // Add a bunch of tokens as left children of `main`, so that it ends up with a very large
+    // left invalidation list.
+    let main = Condition::new();
+    let tokens = (0..10000)
+        .map(|_| {
+            let cond = Condition::new();
+            let token = main.token() & cond.token();
+            (cond, token)
+        })
+        .collect::<Vec<_>>();
+    drop(main);
+    for (_, token) in tokens.iter() {
+        assert!(!token.is_valid());
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_invalidate_big_right() {
+    // Add a bunch of tokens as right children of `main`, so that it ends up with a very large
+    // right search tree.
+    let conds = (0..10000).map(|_| Condition::new()).collect::<Vec<_>>();
+    let main = Condition::new();
+    let tokens = conds
+        .into_iter()
+        .map(|cond| {
+            let token = main.token() & cond.token();
+            (cond, token)
+        })
+        .collect::<Vec<_>>();
+    drop(main);
+    for (_, token) in tokens.iter() {
+        assert!(!token.is_valid());
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
 fn test_multithreaded_construct() {
     use rand::{Rng, SeedableRng};
     const NUM_CONDS: usize = 50;
