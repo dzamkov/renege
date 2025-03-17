@@ -277,7 +277,15 @@ impl<'alloc> Condition<'alloc> {
         alloc: &mut Alloc,
         token: Token<'alloc>,
     ) -> Result<(), Self> {
-        todo!()
+        if let Some(block) = hold(token) {
+            // Add this condition as a left child of the token block
+            self.block.left_parent().store(Some(block.block), Relaxed);
+            insert_left_child(alloc, &block, self.block);
+            unhold_finalize(alloc, block);
+            Ok(())
+        } else {
+            Err(self)
+        }
     }
 
     /// Gets the [`ConditionId`] for this [`Condition`].

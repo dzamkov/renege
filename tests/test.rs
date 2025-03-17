@@ -147,6 +147,24 @@ fn test_callback() {
 }
 
 #[test]
+fn test_invalidate_from() {
+    let a = Condition::new();
+    let b = Condition::new();
+    let c = Condition::new();
+    let d = Condition::new();
+    let b_c_token = b.token() & c.token();
+    let a_d_token = a.token() & d.token();
+    let d_token = d.token();
+    a.invalidate_from_immediately(b_c_token);
+    assert!(a_d_token.is_valid());
+    drop(c);
+    assert!(!a_d_token.is_valid());
+    assert!(d_token.is_valid());
+    d.invalidate_from_immediately(b_c_token);
+    assert!(!d_token.is_valid());
+}
+
+#[test]
 #[cfg_attr(miri, ignore)]
 fn test_multithreaded_construct() {
     use rand::{Rng, SeedableRng};
