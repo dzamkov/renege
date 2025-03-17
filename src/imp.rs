@@ -168,10 +168,53 @@ impl<'alloc> Condition<'alloc> {
             Err(block) => block,
         };
 
-        // SAFETY: The caller must ensure that calling `f(data)` is safe
-        unsafe { install_callback(alloc, &block, f, data) };
-        unhold_finalize(alloc, block);
-        false
+        // Check if the block has no children
+        if block.first_left_child().load(Relaxed).is_none()
+            && block.right_tree().load(Relaxed).is_null()
+        {
+            // The block is invalid and has no children. No more children can be added, so the
+            // next time it attempts finalization, it will be finalized. This means that if we
+            // were to install a callback now, it will be called just before the block is finalized.
+            // Perfect!
+
+            // SAFETY: The caller must ensure that calling `f(data)` is safe
+            unsafe { install_callback(alloc, &block, f, data) };
+            unhold_finalize(alloc, block);
+            false
+        } else {
+            // This case is trickier, the block may still have children and descendants that haven't
+            // been invalidated. If we were to install a callback now, it would be called as
+            // soon as it starts finalization, which is too early since that is well before we
+            // can guarantee that all children have been finalized.
+
+            // We need to make sure the callback is called *after* all children are finalized.
+            // The simplest way to do this, without introducing any new flags/concepts, is to
+            // create an artifical parent of `block` which is being held by `block`. The
+            // parent can't be finalized until `block` finishes finalization, so if we install
+            // the callback on this parent, it will be called at the right time.
+
+            // There are other cases where we add a condition token block as a left child, so
+            // we might as well continue that trend and use an artifical left parent.
+            let parent = alloc.allocate_block();
+            parent.verify_clean();
+            let mut tag = parent.tag.load(Relaxed);
+            debug_assert_eq!(tag.0 & !BlockTag::VERSION_MASK, 0);
+            tag.0 |= BlockTag::TOKEN_FLAG;
+            tag.0 |= BlockTag::INVALID_FLAG; // Ensure the parent will be finalized once unheld
+            tag.0 += 2; // One holder from `block`, one created below
+            parent.tag.store(tag, Relaxed);
+            block.left_parent().store(Some(parent), Relaxed);
+            let parent = TokenBlockHolding { block: parent };
+            // SAFETY: The caller must ensure that calling `f(data)` is safe
+            unsafe { install_callback(alloc, &parent, f, data) };
+            let parent = unhold(parent);
+            debug_assert!(parent.is_none());
+
+            // Now set `block` to be holding `parent`
+            block.tag.0.fetch_or(BlockTag::HOLDING_LEFT_FLAG, AcqRel); // Synchronizes with token unhold
+            unhold_finalize(alloc, block);
+            false
+        }
     }
 
     /// Begins invalidating this [`Condition`].
@@ -596,7 +639,7 @@ struct BranchBeta<'alloc> {
 ///  * If the `HOLD_RIGHT_FLAG` is set, [`TokenBlockFinalizing`] implicitly comes with a
 ///    [`TokenBlockHolding`] for the right parent.
 #[repr(transparent)]
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 struct BlockTag(usize);
 
 impl HasAtomic for BlockTag {
@@ -655,6 +698,11 @@ impl BlockTag {
         Self((self.0 & Self::VERSION_MASK) | Self::TOKEN_FLAG | Self::INVALID_FLAG)
     }
 
+    /// Gets the version number of the tag.
+    pub const fn version(&self) -> usize {
+        self.0 >> Self::VERSION_SHIFT
+    }
+
     /// Indicates whether the `TOKEN_FLAG` is set.
     pub const fn is_token(&self) -> bool {
         self.0 & Self::TOKEN_FLAG != 0
@@ -678,6 +726,19 @@ impl BlockTag {
     /// Gets the current number of [`TokenBlockHolding`]s for this block.
     pub const fn num_holders(&self) -> usize {
         self.0 & Self::NUM_HOLDERS_MASK
+    }
+}
+
+impl std::fmt::Debug for BlockTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockTag")
+            .field("version", &self.version())
+            .field("is_token", &self.is_token())
+            .field("is_invalid", &self.is_invalid())
+            .field("is_holding_left", &self.is_holding_left())
+            .field("is_holding_right", &self.is_holding_right())
+            .field("num_holders", &self.num_holders())
+            .finish()
     }
 }
 
@@ -830,7 +891,7 @@ impl<'alloc> Block<'alloc> {
     fn callback_data(&self) -> &Atomic<*mut ()> {
         // SAFETY: Regardless of what type of block this is, the `callback_data` field is always
         // populated with a valid `Atomic<*mut ()>`.
-        unsafe { &*self.beta.callback_data }
+        unsafe { &self.beta.callback_data }
     }
 
     /// Gets the [`NonBranchBeta::right_tree`] field of this block.
@@ -1759,7 +1820,6 @@ impl<'alloc> FinalizeError<'alloc> for TokenBlockHolding<'alloc> {
                     tag.num_holders() < BlockTag::NUM_HOLDERS_MASK,
                     "maximum number of holders exceeded"
                 );
-                let mut n_tag = tag;
                 n_tag.0 += 1;
                 match block.tag.compare_exchange_weak(tag, n_tag, AcqRel, Acquire) {
                     // Synchronizes with token unhold

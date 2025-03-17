@@ -83,9 +83,16 @@ impl<'alloc> Allocator<'alloc> for &'alloc Storage<'alloc> {
     }
 }
 
+/// Runs concurrent permutations of the provided closure.
+fn model(preemption_bound: Option<usize>, f: impl Fn() + Sync + Send + 'static) {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = preemption_bound;
+    builder.check(f);
+}
+
 #[test]
 fn test_construct() {
-    loom::model(|| {
+    model(None, || {
         let storage = SharedStorage::new();
         storage.with_static_alloc(|alloc| {
             let a = Condition::new(alloc, ConditionId::new(0));
@@ -116,7 +123,7 @@ fn test_construct() {
 
 #[test]
 fn test_invalidate_simple() {
-    loom::model(|| {
+    model(Some(6), || {
         let storage = SharedStorage::new();
         storage.with_static_alloc(|alloc| {
             let a = Condition::new(alloc, ConditionId::new(0));
@@ -150,7 +157,7 @@ fn test_invalidate_simple() {
 
 #[test]
 fn test_invalidate_ordering() {
-    loom::model(|| {
+    model(Some(6), || {
         let storage = SharedStorage::new();
         storage.with_static_alloc(|alloc| {
             let a = Condition::new(alloc, ConditionId::new(0));
@@ -169,7 +176,7 @@ fn test_invalidate_ordering() {
             a.invalidate_immediately(alloc);
             assert!(!a_b_token.is_valid());
             let (_, a_c_token) = c_handle.join().unwrap();
-            assert!(!a_c_token.is_valid())
+            assert!(!a_c_token.is_valid());
         })
     })
 }
