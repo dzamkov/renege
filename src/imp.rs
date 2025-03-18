@@ -830,7 +830,7 @@ impl<'alloc> Atomic<SiblingBlockRef<'alloc>> {
     pub fn mark_removing(&self, order: std::sync::atomic::Ordering) -> Option<&'alloc Block> {
         // TODO: Use `fetch_or` once it is stabilized
         // https://doc.rust-lang.org/std/sync/atomic/struct.AtomicPtr.html#method.fetch_or
-        let mut cur = self.0.load(order);
+        let mut cur = self.0.load(Acquire);
         loop {
             if cur.addr() & SiblingBlockRef::IS_REMOVING_BIT != 0 {
                 return unsafe {
@@ -840,7 +840,7 @@ impl<'alloc> Atomic<SiblingBlockRef<'alloc>> {
                 };
             }
             let new = cur.map_addr(|addr| addr | SiblingBlockRef::IS_REMOVING_BIT);
-            match self.0.compare_exchange_weak(cur, new, Relaxed, order) {
+            match self.0.compare_exchange_weak(cur, new, order, Acquire) {
                 Ok(_) => return unsafe { HasAtomic::from_prim(cur) },
                 Err(old) => cur = old,
             }
@@ -1514,10 +1514,8 @@ unsafe fn insert_right_child<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
 
             // Check whether the block actually belongs to this tree. It's possible for an old
             // member of the tree to be freed and reallocated as a new unrelated block.
-            if !std::ptr::eq(
-                HasAtomic::into_prim(block.right_parent.load(Relaxed)),
-                right_parent.block,
-            ) {
+            let block_right_parent = block.right_parent.load(Acquire); // Synchronizes with right parent removal
+            if !std::ptr::eq(HasAtomic::into_prim(block_right_parent), right_parent.block) {
                 continue 'replace;
             }
 
@@ -1532,7 +1530,7 @@ unsafe fn insert_right_child<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
             };
 
             // Check whether this is the token block we are looking for.
-            let block_left_parent = block.left_parent().load(Relaxed);
+            let block_left_parent = block.left_parent().load(Acquire);
             let token = Token {
                 block,
                 max_tag: tag.max_tag(),
@@ -1611,7 +1609,7 @@ fn hold(token: Token) -> Option<TokenBlockHolding> {
         match token
             .block
             .tag
-            .compare_exchange_weak(tag, n_tag, Relaxed, Relaxed)
+            .compare_exchange_weak(tag, n_tag, AcqRel, Relaxed) // Synchronizes with token unhold
         {
             Ok(_) => return Some(TokenBlockHolding { block: token.block }),
             Err(e_tag) => {
@@ -1691,10 +1689,13 @@ fn finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized, Err: FinalizeError<'alloc
     left_num_holders: Option<&mut usize>,
     right_num_holders: Option<&mut usize>,
 ) -> Result<(), Err> {
-    // Set number of holders to maximum to prevent underflow
-    let mut tag = block.tag.load(Relaxed);
-    tag.0 |= BlockTag::NUM_HOLDERS_MASK;
-    block.tag.store(tag, Relaxed);
+    // Set number of holders to maximum to prevent underflow. Although we are guaranteed to have
+    // zero holders at this point, other threads may still set the holding flag on this token,
+    // so we still need an atomic operation here.
+    let tag = BlockTag(block.tag.0.fetch_add(BlockTag::NUM_HOLDERS_MASK, Relaxed));
+    debug_assert!(tag.is_token());
+    debug_assert!(tag.is_invalid());
+    debug_assert_eq!(tag.num_holders(), 0);
 
     // Invalidate children
     let mut num_holders = 0;
@@ -1745,9 +1746,14 @@ impl<'alloc> FinalizeError<'alloc> for () {
         block: TokenBlockFinalizing<'alloc>,
         amount: usize,
     ) -> Result<TokenBlockFinalizing<'alloc>, ()> {
-        let o_tag = block.tag.0.fetch_sub(amount, AcqRel); // Synchronizes with token unhold
-        debug_assert!(o_tag & BlockTag::NUM_HOLDERS_MASK >= amount);
-        if o_tag & BlockTag::NUM_HOLDERS_MASK == amount {
+        let o_tag = BlockTag(block.tag.0.fetch_sub(amount, AcqRel)); // Synchronizes with token unhold
+        debug_assert!(
+            o_tag.num_holders() >= amount,
+            "attempted to unhold {} holders, but only {} were present",
+            amount,
+            o_tag.num_holders()
+        );
+        if o_tag.num_holders() == amount {
             Ok(block)
         } else {
             std::mem::forget(block);
@@ -1793,7 +1799,7 @@ impl<'alloc> FinalizeError<'alloc> for TokenBlockHolding<'alloc> {
                 n_tag.0 -= amount - 1;
                 match block.tag.compare_exchange_weak(tag, n_tag, AcqRel, Acquire) {
                     // Synchronizes with token unhold
-                    Ok(_) => return Err(TokenBlockHolding { block: block.block }),
+                    Ok(_) => break,
                     Err(n_tag) => {
                         debug_assert_eq!(
                             tag.0 & !BlockTag::NUM_HOLDERS_MASK,
@@ -1804,9 +1810,15 @@ impl<'alloc> FinalizeError<'alloc> for TokenBlockHolding<'alloc> {
                     }
                 }
             } else {
-                return Err(TokenBlockHolding { block: block.block });
+                break;
             }
         }
+
+        // We left an extra holder on the block, so now we can return a `TokenBlockHolding`.
+        let guard = block;
+        let block = guard.block;
+        std::mem::forget(guard);
+        Err(TokenBlockHolding { block })
     }
 
     fn invalidate_condition(
@@ -1899,10 +1911,8 @@ fn start_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
 
         // Check whether the block actually belongs to this tree. It's possible for an old
         // member of the tree to be freed and reallocated as a new unrelated block.
-        if !std::ptr::eq(
-            HasAtomic::into_prim(block.right_parent.load(Relaxed)),
-            right_parent.block,
-        ) {
+        let block_right_parent = block.right_parent.load(Acquire); // Synchronizes with right parent removal
+        if !std::ptr::eq(HasAtomic::into_prim(block_right_parent), right_parent.block) {
             return;
         }
 
@@ -1926,29 +1936,22 @@ fn start_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     }
 
     // Invalidate left children
-    let mut opt_first_child = block.first_left_child().load(Relaxed);
-    while let Some(first_child) = opt_first_child {
+    let mut opt_first_child = block.first_left_child().load(Acquire); // Synchronizes with left child removal
+    'process_child: while let Some(first_child) = opt_first_child {
         // Verify that this is still a left child of `block`.
         let tag = first_child.tag.load(Acquire); // Synchronizes with version increment
-        let first_child_prev_sibling = first_child.prev_left_sibling().load(Relaxed);
-        let first_child_parent = first_child // Synchronizes with left parent removal
-            .left_parent()
-            .load(Acquire);
+        let first_child_parent = first_child.left_parent().load(Relaxed);
         if !std::ptr::eq(HasAtomic::into_prim(first_child_parent), block.block) {
-            // Before `left_child` was invalidated, it must have removed itself from the
-            // left children list.
-            opt_first_child = block.first_left_child().load(Relaxed);
-            debug_assert!(
-                !std::ptr::eq(HasAtomic::into_prim(opt_first_child), first_child),
-                "parent is none: {}",
-                first_child_parent.is_none()
-            );
-            continue;
+            // The child was very recently finalized by another thread and should have removed
+            // itself from the list.
+            fence(Acquire); // Synchronizes with left parent removal
+            opt_first_child = block.first_left_child().load(Acquire); // Synchronizes with left child removal
+            debug_assert!(!std::ptr::eq(
+                HasAtomic::into_prim(opt_first_child),
+                first_child
+            ));
+            continue 'process_child;
         }
-
-        // Since we removed every child before `first_child`, it should not have any previous
-        // siblings.
-        debug_assert!(first_child_prev_sibling.is_none());
 
         // Is this a callback block?
         if !tag.is_token() {
@@ -1973,29 +1976,41 @@ fn start_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
 
             // Call the callback
             unsafe { callback_fn(callback_data) };
-            continue;
+            continue 'process_child;
         }
 
         // Try to invalidate left child token
-        *num_holders += 1;
-        if let Some(first_child) = invalidate_token(BlockTag::HOLDING_LEFT_FLAG, first_child, tag)
-            .expect("finalized token should not be in left child list")
-        {
-            if finalize::<_, ()>(alloc, first_child, Some(num_holders), None).is_ok() {
-                // Since we just ran finalization on this thread, the child should have removed
-                // itself from the left children list.
-                let old_opt_first_child = opt_first_child;
-                opt_first_child = block.first_left_child().load(Relaxed);
-                debug_assert!(!std::ptr::eq(
-                    HasAtomic::into_prim(opt_first_child),
-                    HasAtomic::into_prim(old_opt_first_child)
-                ));
-                continue;
+        'finalize_child: {
+            match invalidate_token(BlockTag::HOLDING_LEFT_FLAG, first_child, tag) {
+                Ok(Some(first_child)) => {
+                    *num_holders += 1;
+                    if finalize::<_, ()>(alloc, first_child, Some(num_holders), None).is_err() {
+                        break 'finalize_child;
+                    }
+                }
+                Ok(None) => {
+                    *num_holders += 1;
+                    break 'finalize_child;
+                }
+                Err(_) => {
+                    // The child was very recently finalized on another thread.
+                }
             }
+
+            // Finalization was recently completed. The child should have removed itself from the
+            // left children list.
+            let old_opt_first_child = opt_first_child;
+            opt_first_child = block.first_left_child().load(Acquire); // Synchronizes with left child removal
+            debug_assert!(!std::ptr::eq(
+                HasAtomic::into_prim(opt_first_child),
+                HasAtomic::into_prim(old_opt_first_child)
+            ));
+            continue 'process_child;
         }
 
-        // This child needs to be finalized by another thread. Let's just get it out of the
-        // way for now.
+        // We weren't able to finalize the child immediately. It will be finalized later
+        // (possibly by another thread). Just get it out of the way for now. It has been
+        // invalidated so there is no need to keep it in the list.
         opt_first_child = force_remove_left_child(&*block, first_child);
     }
 }
@@ -2008,53 +2023,60 @@ fn finish_finalize<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     left_num_holders: Option<&mut usize>,
     right_num_holders: Option<&mut usize>,
 ) {
-    let tag = block.tag.load(Relaxed);
-    debug_assert!(tag.is_token());
-    debug_assert!(tag.is_invalid());
-    debug_assert_eq!(tag.num_holders(), 0);
-
     // Clean up links to left parent
-    if let Some(left_parent) = block.left_parent().load(Relaxed) {
+    let left_parent = block.left_parent().load(Relaxed);
+    if let Some(left_parent) = left_parent {
         remove_left_child(left_parent, &mut block);
-        if tag.is_holding_left() {
-            if let Some(left_num_holders) = left_num_holders {
-                *left_num_holders -= 1;
-            } else {
-                unhold_finalize(alloc, TokenBlockHolding { block: left_parent });
-            }
-        }
         block // Synchronizes with left parent removal
             .left_parent()
             .store(None, Release);
         block.prev_left_sibling().store(None, Relaxed);
-        block // Synchronizes with left sibling removal
+        block // Synchronizes with left child removal
             .next_left_sibling()
             .store(SiblingBlockRef::NONE, Release);
     }
 
     // Clean up links to right parent
-    if let Some(right_parent) = block.right_parent.load(Relaxed) {
-        if tag.is_holding_right() {
-            if let Some(right_num_holders) = right_num_holders {
-                *right_num_holders -= 1;
-            } else {
-                unhold_finalize(
-                    alloc,
-                    TokenBlockHolding {
-                        block: right_parent,
-                    },
-                );
-            }
-        }
-        block.right_parent.store(None, Relaxed);
-    }
+    let right_parent = block.right_parent.load(Relaxed);
+    block.right_parent.store(None, Release); // Synchronizes with right parent removal
+
+    // Increment version number
+    let tag = block.tag.load(Relaxed);
+    let tag = block.tag.swap(tag.next(), Release); // Synchronizes with version increment
+    debug_assert!(tag.is_token());
+    debug_assert!(tag.is_invalid());
+    debug_assert_eq!(tag.num_holders(), 0);
 
     // Free the block
     let guard = block;
     let block = guard.block;
     std::mem::forget(guard);
-    block.tag.store(tag.next(), Release); // Synchronizes with version increment
     alloc.free_block(block);
+
+    // Unhold parent blocks
+    if tag.is_holding_left() {
+        // SAFETY: The `HOLDING_LEFT_FLAG` can only be set by the left parent, so it must exist.
+        let left_parent = unsafe { left_parent.unwrap_unchecked() };
+        if let Some(left_num_holders) = left_num_holders {
+            *left_num_holders -= 1;
+        } else {
+            unhold_finalize(alloc, TokenBlockHolding { block: left_parent });
+        }
+    }
+    if tag.is_holding_right() {
+        // SAFETY: The `HOLDING_RIGHT_FLAG` can only be set by the right parent, so it must exist.
+        let right_parent = unsafe { right_parent.unwrap_unchecked() };
+        if let Some(right_num_holders) = right_num_holders {
+            *right_num_holders -= 1;
+        } else {
+            unhold_finalize(
+                alloc,
+                TokenBlockHolding {
+                    block: right_parent,
+                },
+            );
+        }
+    }
 }
 
 /// Attempts to invalidate a [`Token`], returning `Err` if it has already been finalized.
@@ -2080,7 +2102,7 @@ fn invalidate_token<'alloc>(
         n_tag.0 |= holding_flag;
         match block
             .tag
-            .compare_exchange_weak(tag, n_tag, Acquire, Relaxed) // Synchronizes with token unhold
+            .compare_exchange_weak(tag, n_tag, AcqRel, Acquire) // Synchronizes with token unhold and version increment
         {
             Ok(tag) => {
                 // Are we responsible for finalizing the block?
@@ -2129,25 +2151,65 @@ fn insert_left_child<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
     block: &'alloc Block<'alloc>,
 ) {
     let first_child_slot = &left_parent.first_left_child();
-    let mut opt_first_child = first_child_slot.load(Acquire);
+    let mut opt_first_child = first_child_slot.load(Acquire); // Synchronizes with left child removal
     loop {
         block
             .next_left_sibling()
             .store(SiblingBlockRef::new(opt_first_child, false), Relaxed);
         if let Some(first_child) = opt_first_child {
-            // Before inserting a new child at the front of the list, we will hold the current
-            // first child. This greatly simplifies the logic for lock-free removal of an
-            // arbitrary child in the list because we won't have to worry about
-            // `prev_left_sibling` being out of date.
-            if let Some(first_child) = hold(first_child.token()) {
+            // Check whether `first_child` still belongs to `left_parent`.
+            let tag = first_child.tag.load(Acquire); // Synchronizes with version increment
+            let first_child_parent = first_child.left_parent().load(Relaxed);
+            if !std::ptr::eq(HasAtomic::into_prim(first_child_parent), left_parent.block) {
+                // The child was very recently finalized by another thread and should have removed
+                // itself from the list.
+                fence(Acquire); // Synchronizes with left parent removal
+                opt_first_child = first_child_slot.load(Acquire); // Synchronizes with left child removal
+                debug_assert!(!std::ptr::eq(
+                    HasAtomic::into_prim(opt_first_child),
+                    first_child
+                ));
+                continue;
+            }
+
+            // Is this a callback block?
+            if !tag.is_token() {
+                // Callback blocks won't be removed from the list until `left_parent` is
+                // being finalized, and that can't happen while we're holding it.
                 match first_child_slot.compare_exchange_weak(
                     opt_first_child,
                     Some(block),
-                    Release,
+                    AcqRel, // Synchronizes with left child removal
                     Acquire,
                 ) {
                     Ok(_) => {
-                        first_child.prev_left_sibling().store(Some(block), Release);
+                        first_child.prev_left_sibling().store(Some(block), Relaxed);
+                        break;
+                    }
+                    Err(n_opt_first_child) => {
+                        opt_first_child = n_opt_first_child;
+                        continue;
+                    }
+                }
+            }
+
+            // Before inserting a new child at the front of the list, we will hold the current
+            // first child. This greatly simplifies the logic for lock-free removal of an
+            // arbitrary child token in the list because we won't have to worry about
+            // `prev_left_sibling` being out of date.
+            let token = Token {
+                block: first_child,
+                max_tag: tag.max_tag(),
+            };
+            if let Some(first_child) = hold(token) {
+                match first_child_slot.compare_exchange_weak(
+                    opt_first_child,
+                    Some(block),
+                    AcqRel, // Synchronizes with left child removal
+                    Acquire,
+                ) {
+                    Ok(_) => {
+                        first_child.prev_left_sibling().store(Some(block), Relaxed);
                         unhold_finalize(alloc, first_child);
                         break;
                     }
@@ -2164,7 +2226,12 @@ fn insert_left_child<'alloc, Alloc: Allocator<'alloc> + ?Sized>(
             }
         } else {
             // Try to insert block as first child
-            match first_child_slot.compare_exchange_weak(None, Some(block), Release, Acquire) {
+            match first_child_slot.compare_exchange_weak(
+                None,
+                Some(block),
+                AcqRel, // Synchronizes with left child removal
+                Acquire,
+            ) {
                 Ok(_) => break,
                 Err(n_opt_next_sibling) => {
                     opt_first_child = n_opt_next_sibling;
@@ -2182,7 +2249,7 @@ fn remove_left_child<'alloc>(
 ) {
     // First, we mark `next_left_sibling` as removing so that if `to_sibling` is itself being
     // removed, it will not try to modify our `next_left_sibling`, which we will no longer read.
-    let to_sibling = block.block.next_left_sibling().mark_removing(Relaxed);
+    let to_sibling = block.block.next_left_sibling().mark_removing(AcqRel); // Synchronizes with left child removal
 
     // Ensure that `block` is no longer in the list of children.
     let between_siblings = BlockList {
@@ -2228,16 +2295,14 @@ fn remove_left_child<'alloc>(
             match from_sibling.next_left_sibling().compare_exchange_weak(
                 SiblingBlockRef::new(Some(before_to_sibling), false),
                 SiblingBlockRef::new(to_sibling, false),
-                Relaxed,
-                Acquire, // Synchronizes with left sibling removal
+                AcqRel, // Synchronizes with left child removal
+                Acquire,
             ) {
                 Ok(_) => (),
                 Err(e_next_sibling) => {
                     // Ensure that `from_sibling` is still in the list of children.
-                    if !std::ptr::eq(
-                        HasAtomic::into_prim(from_sibling.left_parent().load(Relaxed)),
-                        left_parent,
-                    ) {
+                    let from_sibling_parent = from_sibling.left_parent().load(Acquire); // Synchronizes with left parent removal
+                    if !std::ptr::eq(HasAtomic::into_prim(from_sibling_parent), left_parent) {
                         return false;
                     }
 
@@ -2263,8 +2328,8 @@ fn remove_left_child<'alloc>(
                                 .compare_exchange_weak(
                                     SiblingBlockRef::new(Some(e_next_sibling), false),
                                     SiblingBlockRef::new(to_sibling, false),
-                                    Relaxed,
-                                    Relaxed,
+                                    AcqRel, // Synchronizes with left child removal
+                                    Acquire,
                                 )
                                 .is_err()
                             {
@@ -2286,8 +2351,8 @@ fn remove_left_child<'alloc>(
             match first_left_child.compare_exchange_weak(
                 Some(before_to_sibling),
                 to_sibling,
-                Relaxed,
-                Relaxed,
+                AcqRel, // Synchronizes with left child removal
+                Acquire,
             ) {
                 Ok(_) => (),
                 Err(None) => {
@@ -2299,8 +2364,8 @@ fn remove_left_child<'alloc>(
                             .compare_exchange_weak(
                                 Some(e_first_sibling),
                                 to_sibling,
-                                Relaxed,
-                                Relaxed,
+                                AcqRel, // Synchronizes with left child removal
+                                Acquire,
                             )
                             .is_err()
                         {
@@ -2352,7 +2417,7 @@ fn force_remove_left_child<'alloc>(
     left_parent: &TokenBlockHolding<'alloc>,
     block: &'alloc Block<'alloc>,
 ) -> Option<&'alloc Block<'alloc>> {
-    let mut next_sibling = block.next_left_sibling().load(Relaxed);
+    let mut next_sibling = block.next_left_sibling().load(Acquire); // Synchronizes with left child removal
     loop {
         let block_parent = block.left_parent().load(Acquire); // Synchronizes with left parent removal
         if !std::ptr::eq(HasAtomic::into_prim(block_parent), left_parent.block) {
@@ -2368,8 +2433,8 @@ fn force_remove_left_child<'alloc>(
             if let Err(n_next_sibling) = block.next_left_sibling().compare_exchange_weak(
                 next_sibling,
                 SiblingBlockRef::new(next_sibling.source(), true),
-                Relaxed,
-                Relaxed,
+                AcqRel, // Synchronizes with left child removal
+                Acquire,
             ) {
                 next_sibling = n_next_sibling;
                 continue;
@@ -2381,8 +2446,8 @@ fn force_remove_left_child<'alloc>(
         match left_parent.first_left_child().compare_exchange_weak(
             Some(block),
             next_sibling,
-            Relaxed,
-            Relaxed,
+            AcqRel, // Synchronizes with left child removal
+            Acquire,
         ) {
             Ok(_) => {
                 fix_prev(None, block, next_sibling);

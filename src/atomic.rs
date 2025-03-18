@@ -73,6 +73,7 @@ pub trait IsAtomic {
     fn new(value: Self::Prim) -> Self;
     fn load(&self, order: Ordering) -> Self::Prim;
     fn store(&self, val: Self::Prim, order: Ordering);
+    fn swap(&self, val: Self::Prim, order: Ordering) -> Self::Prim;
     fn compare_exchange(
         &self,
         current: Self::Prim,
@@ -99,6 +100,9 @@ impl IsAtomic for AtomicUsize {
     }
     fn store(&self, val: Self::Prim, order: Ordering) {
         self.store(val, order)
+    }
+    fn swap(&self, val: Self::Prim, order: Ordering) -> Self::Prim {
+        self.swap(val, order)
     }
     fn compare_exchange(
         &self,
@@ -130,6 +134,9 @@ impl<T> IsAtomic for AtomicPtr<T> {
     }
     fn store(&self, val: Self::Prim, order: Ordering) {
         self.store(val, order)
+    }
+    fn swap(&self, val: Self::Prim, order: Ordering) -> Self::Prim {
+        self.swap(val, order)
     }
     fn compare_exchange(
         &self,
@@ -173,6 +180,12 @@ impl<Store: HasAtomic, Load: HasAtomic<Prim = Store::Prim> + SafeTransmuteFrom<S
     /// Stores a value into the [`Atomic`].
     pub fn store(&self, val: Store, order: Ordering) {
         self.0.store(Store::into_prim(val), order);
+    }
+
+    /// Stores a value into the [`Atomic`], returning the previous value.
+    pub fn swap(&self, val: Store, order: Ordering) -> Load {
+        let res = self.0.swap(Store::into_prim(val), order);
+        unsafe { Load::from_prim(res) }
     }
 
     /// Stores a value into the [`Atomic`] if the current value is the same as `current`.

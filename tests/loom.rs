@@ -123,7 +123,7 @@ fn test_construct() {
 
 #[test]
 fn test_invalidate_simple() {
-    model(Some(6), || {
+    model(Some(7), || {
         let storage = SharedStorage::new();
         storage.with_static_alloc(|alloc| {
             let a = Condition::new(alloc, ConditionId::new(0));
@@ -157,7 +157,7 @@ fn test_invalidate_simple() {
 
 #[test]
 fn test_invalidate_ordering() {
-    model(Some(6), || {
+    model(None, || {
         let storage = SharedStorage::new();
         storage.with_static_alloc(|alloc| {
             let a = Condition::new(alloc, ConditionId::new(0));
@@ -178,5 +178,41 @@ fn test_invalidate_ordering() {
             let (_, a_c_token) = c_handle.join().unwrap();
             assert!(!a_c_token.is_valid());
         })
+    })
+}
+
+#[test]
+fn test_complex() {
+    model(Some(2), || {
+        let storage = SharedStorage::new();
+        storage.with_static_alloc(|alloc| {
+            let a = Condition::new(alloc, ConditionId::new(0));
+            let b = Condition::new(alloc, ConditionId::new(1));
+            let c = Condition::new(alloc, ConditionId::new(2));
+            let a_token = a.token();
+            let b_token = b.token();
+            let c_token = c.token();
+            let handle_0 = {
+                let storage = storage.clone();
+                loom::thread::spawn(move || storage.with_static_alloc(|alloc| {
+                    let a_b_token = Token::combine(alloc, a_token, b_token);
+                    let a_b_c_token = Token::combine(alloc, a_b_token, c_token);
+                    a.invalidate_immediately(alloc);
+                    assert!(!a_b_token.is_valid());
+                    assert!(!a_b_c_token.is_valid());
+                }))
+            };
+            let handle_1 = {
+                let storage = storage.clone();
+                loom::thread::spawn(move || storage.with_static_alloc(|alloc| {
+                    let a_c_token = Token::combine(alloc, a_token, c_token);
+                    let _ = Token::combine(alloc, a_token, b_token);
+                    c.invalidate_immediately(alloc);
+                    assert!(!a_c_token.is_valid());
+                }))
+            };
+            handle_0.join().unwrap();
+            handle_1.join().unwrap();
+        });
     })
 }
