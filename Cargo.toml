@@ -6,7 +6,7 @@ authors = ["Dmitry Zamkov <dmitry94@gmail.com>"]
 description = "Tracking cache validity using fast concurrent invalidation propogation."
 repository = "https://github.com/dzamkov/renege"
 license = "MIT OR Apache-2.0"
-keywords = ["cache", "invalidation", "validity", "frp"]
+keywords = ["cache", "invalidation", "lock-free", "frp"]
 categories = ["rust-patterns", "data-structures", "concurrency", "caching"]
 readme = "README.md"
 

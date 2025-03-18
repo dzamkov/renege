@@ -69,6 +69,9 @@ mod global {
         /// Sets this [`Condition`] to be invalidated "immediately" once `token` is no longer
         /// valid.
         ///
+        /// Note that will cause a memory leak if `token` is [`Token::always`], since there would
+        /// be no way to invalidate the condition.
+        ///
         /// See [`alloc::Condition::invalidate_from_immediately`] for more details.
         pub fn invalidate_from_immediately(self, token: Token) {
             let inner = alloc::Condition::from(self);
@@ -82,6 +85,9 @@ mod global {
         /// This can only fail if `token` is already invalid, in which case it will return the
         /// condition unchanged. Unlike [`Condition::invalidate_from_immediately`], this will never
         /// block the current thread.
+        ///
+        /// Note that will cause a memory leak if `token` is [`Token::always`], since there would
+        /// be no way to invalidate the condition.
         ///
         /// See [`alloc::Condition::try_invalidate_from`] for more details.
         pub fn try_invalidate_from(self, token: Token) -> Result<(), Self> {

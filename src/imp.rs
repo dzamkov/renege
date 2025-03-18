@@ -235,9 +235,6 @@ impl<'alloc> Condition<'alloc> {
     /// [`Condition::invalidate_immediately`]. Note that this may block the current thread. If
     /// this is not acceptable, use [`Condition::try_invalidate_from`] instead.
     ///
-    /// Note that will cause a memory leak if `token` is [`Token::always`], since there would be
-    /// no way to invalidate the condition.
-    ///
     /// # Memory Ordering
     ///
     /// Let `x` be any [`Token`] that was constructed from `self.token()`.
@@ -261,9 +258,6 @@ impl<'alloc> Condition<'alloc> {
     /// This can only fail if `token` is already invalid, in which case it will return the
     /// condition unchanged. Unlike [`Condition::invalidate_from_immediately`], this will never
     /// block the current thread.
-    ///
-    /// Note that will cause a memory leak if `token` is [`Token::always`], since there would be
-    /// no way to invalidate the condition.
     ///
     /// # Memory Ordering
     ///
@@ -514,18 +508,21 @@ pub struct Block<'alloc> {
 
     /// The "protected" data for this [`Block`].
     ///
-    /// This may be accessed immutably when the block is held (see [`hold`]), and mutably while the
-    /// block is being finalized or initialized.
+    /// This may be accessed immutably if this block is a [`BlockType::Token`] block (and it
+    /// can be guaranteed that it will remain one for the duration of the access).
+    /// 
+    /// This may be accessed mutably if this block is a [`BlockType::Callback`] block.
     ///
-    /// This is required because there is no portable way of storing a function pointer in
-    /// an [`Atomic`], as needed by `callback_fn`. To minimize [`Block`]s size, we store the
+    /// [`UnsafeCell`] is required because there is no portable way of storing a function pointer
+    /// in an [`Atomic`], as needed by `callback_fn`. To minimize [`Block`]s size, we store the
     /// mutually-exclusive field `first_left_child` in the same union.
     protected: UnsafeCell<Protected<'alloc>>,
 
     /// The [`BlockType::Token`] block which is the "right" parent of this block. The right parent
     /// of [`BlockType::Callback`] blocks is always [`None`].
     ///
-    /// This may not change while the block is live.
+    /// This may not change while the block is live. It must be set to [`None`] before
+    /// incrementing the block's `VERSION` and freeing the block.
     ///
     /// The `range` of the parent tokens must not overlap, with all [`ConditionId`]s in the `range`
     /// of the left parent token being less than those in the `range` of the right parent token.
@@ -579,6 +576,9 @@ struct NonBranchBeta<'alloc> {
     pub right_tree: Atomic<Option<&'alloc Block<'alloc>>>,
 
     /// The [`BlockType::Token`] block which is the "left" parent of this block.
+    /// 
+    /// This may only change from [`None`] while the block is live. It must be set to [`None`]
+    /// before incrementing the block's `VERSION` and freeing the block.
     ///
     /// The `range` of the parent tokens must not overlap, with all [`ConditionId`]s in the `range`
     /// of the left parent token being less than those in the `range` of the right parent token.
@@ -755,14 +755,6 @@ impl std::fmt::Debug for BlockTag {
 /// This struct exists for documentation purposes only.
 #[allow(dead_code)]
 enum BlockType {
-    /// A block which indexes a subset of right children for the [`BlockType::Token`] block
-    /// that is its `right_parent`.
-    ///
-    /// These blocks are "owned" by the corresponding token block, and their lifecycle is
-    /// inextricably linked to it. Thus, the only bits in [`BlockTag`] which are used are
-    /// the version number (which remains constant) and the type.
-    Branch,
-
     /// A block which corresponds to a [`Token`].
     ///
     /// This is the only type of block which can have children. It keeps a list of its left
@@ -770,8 +762,23 @@ enum BlockType {
     /// must ensure that all of its children are finalized.
     Token,
 
-    /// Similar to a [`BlockType::Token`] block, but instead of having children, it has a
-    /// callback function which must be called before completing finalization.
+    /// A block which indexes a subset of right children for the [`BlockType::Token`] block
+    /// that is its `right_parent`.
+    ///
+    /// These blocks are "owned" by their right parent, and their lifecycle is inextricably
+    /// linked to it. Thus, the only bits in [`BlockTag`] which are used are the version number
+    /// (which remains constant).
+    Branch,
+
+    /// A block which can be inserted into the list of left children for a [`BlockType::Token`]
+    /// token.
+    /// 
+    /// Upon being invalidated, instead of performing invalidation propogation, it will call
+    /// `callback_fn(callback_data)`.
+    /// 
+    /// These blocks are "owned" by their left parent, and their lifecycle is inextricably
+    /// linked to it. Thus, the only bits in [`BlockTag`] which are used are the version number
+    /// (which remains constant).
     Callback,
 }
 
@@ -953,7 +960,7 @@ impl<'alloc> Block<'alloc> {
 }
 
 // SAFETY: The only field which is potentially not `Sync` is the `protected` field, which can only
-// accessed in the module. All of these accesses have their own safety documentation.
+// be accessed in the module. All of these accesses have their own safety documentation.
 unsafe impl Sync for Block<'_> {}
 
 impl Default for Block<'_> {
@@ -2497,7 +2504,7 @@ fn fix_prev<'alloc>(
                 loop {
                     if std::ptr::eq(test_sibling, before_to_sibling) {
                         continue 'retry;
-                    } else if test_sibling.token().is_valid() {
+                    } else if !test_sibling.tag.load(Relaxed).is_invalid() {
                         // There are no valid blocks between `before_to_sibling` and `to_sibling`,
                         // so if `test_sibling` is valid, it must already be before
                         // `before_to_sibling`.

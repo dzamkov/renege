@@ -76,12 +76,14 @@ assert!(!normality.is_valid());
 * `Token::is_valid()` is extremely fast, requiring just a single atomic read, regardless of how
 many conditions it's tracking.
 
+* `Token` is `Copy`.
+
 * **Fully concurrent:** `Condition`s and `Token`s can freely be sent between threads. Invalidations
-on one thread will propogate to all other threads. All operations on `Token`s are
+on one thread will propogate to all other threads. All core operations are
 [lock-free](https://en.wikipedia.org/wiki/Non-blocking_algorithm).
 
 * Aggressive deduplication ensures that at most one `Token` is created for a given set of
-`Condition`s, regardless of how and where it is constructed. e.g. Assuming `a`, `b`, and `c` are
+`Condition`s, regardless of how and where they are constructed. e.g. Assuming `a`, `b`, and `c` are
 all tokens, one thread can build `(a & b) & (b & c)` while another thread builds `a & b & c`,
 and they will both end up with the same `Token` sharing the same underlying storage.
 
