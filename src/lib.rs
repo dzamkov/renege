@@ -6,6 +6,9 @@ mod atomic;
 mod imp;
 mod util;
 
+#[cfg(all(test, loom))]
+mod loom;
+
 #[cfg(not(loom))]
 pub use global::{Condition, Token};
 

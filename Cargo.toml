@@ -13,7 +13,7 @@ readme = "README.md"
 [dev-dependencies]
 rand = { version = "0.9.0", default-features = false, features = ["small_rng"] }
 
-[target.'cfg(loom)'.dependencies]
+[target.'cfg(loom)'.dev-dependencies]
 loom = { version = "0.7", features = ["checkpoint"] }
 
 [lints.rust]

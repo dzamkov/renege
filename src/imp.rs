@@ -55,9 +55,9 @@ impl<'alloc> Condition<'alloc> {
     /// [happen after](https://en.wikipedia.org/wiki/Happened-before)
     /// this call are guaranteed to return `false`.
     pub fn invalidate_immediately<Alloc: Allocator<'alloc> + ?Sized>(self, alloc: &mut Alloc) {
-        #[cfg(loom)]
+        #[cfg(all(test, loom))]
         use loom::thread::{Thread, current, park};
-        #[cfg(not(loom))]
+        #[cfg(not(all(test, loom)))]
         use std::thread::{Thread, current, park};
 
         // Store information required to park/unpark the current thread. We can safely store this
@@ -330,12 +330,12 @@ impl<'alloc> Token<'alloc> {
     /// # use renege::Token;
     /// assert!(Token::always().is_valid())
     /// ```
-    #[cfg(not(loom))]
+    #[cfg(not(all(test, loom)))]
     pub const fn always() -> Self {
         Self::always_inner(&ALWAYS_NEVER)
     }
 
-    #[cfg(loom)]
+    #[cfg(all(test, loom))]
     pub fn always() -> Self {
         Self::always_inner(&ALWAYS_NEVER)
     }
@@ -362,12 +362,12 @@ impl<'alloc> Token<'alloc> {
     /// # use renege::Token;
     /// assert!(!Token::never().is_valid())
     /// ```
-    #[cfg(not(loom))]
+    #[cfg(not(all(test, loom)))]
     pub const fn never() -> Self {
         Self::never_inner(&ALWAYS_NEVER)
     }
 
-    #[cfg(loom)]
+    #[cfg(all(test, loom))]
     pub fn never() -> Self {
         Self::never_inner(&ALWAYS_NEVER)
     }
@@ -977,7 +977,7 @@ impl std::fmt::Debug for Block<'_> {
 }
 
 /// A special [`Block`] used to implement the "always" and "never" tokens.
-#[cfg(not(loom))]
+#[cfg(not(all(test, loom)))]
 static ALWAYS_NEVER: Block<'static> = Block {
     tag: Atomic::from_prim(BlockTag::new(1, true).0),
     // Use a high range so that this block will always be the "right parent" of a combined
@@ -997,7 +997,7 @@ static ALWAYS_NEVER: Block<'static> = Block {
     },
 };
 
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 loom::lazy_static! {
     static ref ALWAYS_NEVER: Block<'static> = Block {
         tag: Atomic::new(BlockTag::new(1, true)),

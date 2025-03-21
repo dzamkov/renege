@@ -1,9 +1,9 @@
 //! This module contains helper types and functions for working with atomic values.
 use crate::util::SafeTransmuteFrom;
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 pub use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, fence};
 use std::sync::atomic::Ordering;
-#[cfg(not(loom))]
+#[cfg(not(all(test, loom)))]
 pub use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, fence};
 
 /// A wrapper over an atomic type which can be loaded as a `Load` and stored as a `Store`.
@@ -244,7 +244,7 @@ impl<Store: HasAtomic, Load: HasAtomic<Prim = Store::Prim> + SafeTransmuteFrom<S
     }
 }
 
-#[cfg(not(loom))]
+#[cfg(not(all(test, loom)))]
 impl<T: HasAtomic<Prim = usize>> Atomic<T> {
     /// Constructs an [`Atomic`] wrapper over the given primitive value.
     ///
@@ -254,7 +254,7 @@ impl<T: HasAtomic<Prim = usize>> Atomic<T> {
     }
 }
 
-#[cfg(not(loom))]
+#[cfg(not(all(test, loom)))]
 impl<Ptr: HasAtomic<Prim = *mut T>, T> Atomic<Ptr> {
     /// Constructs an [`Atomic`] wrapper over the null pointer.
     pub const fn null() -> Self {

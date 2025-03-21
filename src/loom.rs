@@ -1,5 +1,4 @@
-#![cfg(loom)]
-use renege::alloc::{Allocator, Block, Condition, ConditionId, Token};
+use crate::alloc::{Allocator, Block, Condition, ConditionId, Token};
 
 /// The backing storage used by the allocator.
 ///
